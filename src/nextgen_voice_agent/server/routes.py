@@ -213,3 +213,29 @@ async def get_voice_session_transcript(
     orchestrator: VoiceSessionOrchestrator = Depends(get_voice_orchestrator),
 ) -> dict[str, str | None]:
     return await orchestrator.get_transcript(session_id)
+
+
+class WebRTCOfferRequest(BaseModel):
+    sdp: str
+    type: str
+    session_id: str
+
+webrtc_manager = None
+
+@router.post("/webrtc/offer", response_model=dict[str, str])
+async def webrtc_offer(
+    request: WebRTCOfferRequest,
+    orchestrator: VoiceSessionOrchestrator = Depends(get_voice_orchestrator)
+) -> dict[str, str]:
+    global webrtc_manager
+    if webrtc_manager is None:
+        from nextgen_voice_agent.transports.webrtc import WebRTCSessionManager
+        webrtc_manager = WebRTCSessionManager(orchestrator)
+        
+    answer = await webrtc_manager.create_connection(
+        session_id=request.session_id,
+        offer_sdp=request.sdp,
+        offer_type=request.type
+    )
+    return {"sdp": answer.sdp, "type": answer.type}
+

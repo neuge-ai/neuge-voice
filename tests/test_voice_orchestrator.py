@@ -383,3 +383,63 @@ async def test_rejected_barge_in_does_not_start_task_or_stop_assistant_audio() -
     assert state.active_task_id is None
     assert not controller.tasks
     await orchestrator.stop_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_blocks_delivery_during_assistant_ack_timeout() -> None:
+    controller = AgentController(runtime=FakeRuntime(delay_seconds=0.005))
+    orchestrator = VoiceSessionOrchestrator(
+        controller=controller,
+        timing=VoiceTimingConfig(control_loop_ms=10, assistant_ack_timeout_ms=500),
+    )
+    session_id = "browser-session"
+    state = await orchestrator.start_session(session_id, VoiceTransportKind.BROWSER)
+
+    # 1. Trigger user turn
+    init_events = await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(
+            event=VoiceEventType.USER_TURN,
+            transport=VoiceTransportKind.BROWSER,
+            session_id=session_id,
+            text="Trigger fast task.",
+        ),
+    )
+
+    # Allow task to finish, control loop will poll and see the queued result.
+    # However, since client hasn't started speaking the acknowledgement (no ASSISTANT_SPEECH_STARTED),
+    # and we are within 500ms timeout, the result delivery must be blocked.
+    await asyncio.sleep(0.05)
+    
+    # The initial event should have the assistant response (acknowledgement)
+    assert any(e.event == VoiceEventType.ASSISTANT_RESPONSE for e in init_events)
+
+    events = await orchestrator.drain_events(session_id)
+    # The subsequent queue should NOT have the delivery ready event.
+    assert all(e.event != VoiceEventType.DELIVERY_READY for e in events)
+
+    # 2. Simulate client starting the acknowledgement speech
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(
+            event=VoiceEventType.ASSISTANT_SPEECH_STARTED,
+            transport=VoiceTransportKind.BROWSER,
+            session_id=session_id,
+        ),
+    )
+    
+    # 3. Simulate client ending the acknowledgement speech
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(
+            event=VoiceEventType.ASSISTANT_SPEECH_ENDED,
+            transport=VoiceTransportKind.BROWSER,
+            session_id=session_id,
+        ),
+    )
+
+    # Now the control loop should eagerly deliver the result
+    delivered = await wait_for_voice_event(orchestrator, session_id, VoiceEventType.DELIVERY_READY)
+    assert delivered is not None
+    await orchestrator.stop_session(session_id)
+

@@ -11,11 +11,60 @@ import {
   type HealthStatus,
   type RealtimeSessionConfig,
   type Task,
-  type TtsResult,
 } from "./api/agentApi";
 import { EventLog } from "./components/EventLog";
 import { BrowserVoiceTransport, type BrowserVoiceEvent, type VoiceEventInput } from "./realtime/browserVoiceTransport";
 import { useMicrophone } from "./realtime/useMicrophone";
+
+// ---------------------------------------------------------------------------
+// TTS Playback Queue
+// Each queued item is a thunk that returns a Promise which resolves when that
+// utterance finishes (or is cancelled).  The queue drains serially: item N+1
+// starts only after item N's promise resolves.  Calling flushTtsQueue() cancels
+// everything in flight immediately.
+// ---------------------------------------------------------------------------
+type TtsQueueItem = {
+  text: string;
+  cancelled: boolean;
+  resolveCancel: () => void;
+};
+
+class TtsPlaybackQueue {
+  private queue: TtsQueueItem[] = [];
+  private running = false;
+
+  /** Add a text utterance to the back of the queue and start draining if idle. */
+  enqueue(
+    text: string,
+    play: (item: TtsQueueItem) => Promise<void>,
+  ): void {
+    const item: TtsQueueItem = { text, cancelled: false, resolveCancel: () => {} };
+    this.queue.push(item);
+    if (!this.running) {
+      void this.drain(play);
+    }
+  }
+
+  /** Cancel all queued and currently-playing utterances immediately. */
+  flush(): void {
+    for (const item of this.queue) {
+      item.cancelled = true;
+      item.resolveCancel();
+    }
+    this.queue = [];
+  }
+
+  private async drain(play: (item: TtsQueueItem) => Promise<void>): Promise<void> {
+    this.running = true;
+    while (this.queue.length > 0) {
+      const item = this.queue.shift()!;
+      if (!item.cancelled) {
+        await play(item);
+      }
+    }
+    this.running = false;
+  }
+}
 
 async function createPlayableAudioUrl(audioRef: string): Promise<string> {
   if (!audioRef.startsWith("data:")) {
@@ -120,6 +169,8 @@ export function App() {
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioObjectUrlRef = useRef<string | null>(null);
+  // Single serial TTS queue — survives re-renders because it lives in a ref.
+  const ttsQueue = useRef<TtsPlaybackQueue>(new TtsPlaybackQueue());
   const [assistantSpeaking, setAssistantSpeaking] = useState(false);
   const [backendConnected, setBackendConnected] = useState(false);
   const [events, setEvents] = useState<AgentEvent[]>([]);
@@ -132,102 +183,188 @@ export function App() {
   const [demoTaskText, setDemoTaskText] = useState("Check this week's weather and average noon/evening temperatures.");
   const [error, setError] = useState<string | null>(null);
 
-  const stopCurrentSpeech = useCallback(() => {
+  /** Cancel every queued/in-flight TTS utterance immediately. */
+  const flushTtsQueue = useCallback(() => {
+    ttsQueue.current.flush();
+    // Stop any <audio> element currently playing.
     audioRef.current?.pause();
     audioRef.current = null;
     if (audioObjectUrlRef.current) {
       URL.revokeObjectURL(audioObjectUrlRef.current);
       audioObjectUrlRef.current = null;
     }
-    if ("speechSynthesis" in window) {
-      window.speechSynthesis.cancel();
+    // Stop any browser speech synthesis utterance.
+    if (utteranceRef.current) {
+      window.speechSynthesis?.cancel();
+      utteranceRef.current = null;
     }
-    utteranceRef.current = null;
     setAssistantSpeaking(false);
   }, []);
 
-  const speakText = useCallback(
-    async (text: string) => {
-      let result: TtsResult;
+  const stopCurrentSpeech = useCallback(() => {
+    flushTtsQueue();
+  }, [flushTtsQueue]);
+
+  /**
+   * Play one TTS item from the queue.  Resolves when the audio finishes
+   * OR when the item is cancelled (by flushTtsQueue).
+   */
+  const playTtsItem = useCallback(
+    async (item: TtsQueueItem): Promise<void> => {
+      if (item.cancelled) return;
+
+      let result: Awaited<ReturnType<typeof synthesizeSpeech>>;
       try {
-        result = await synthesizeSpeech(text);
+        result = await synthesizeSpeech(item.text);
       } catch (exc) {
-        setAssistantSpeaking(false);
-        setError(exc instanceof Error ? exc.message : "Backend TTS synthesis failed.");
+        setError(exc instanceof Error ? exc.message : "TTS failed");
         return;
       }
 
-      if (result.provider === "browser_dev") {
-        if (!result.text) {
-          setAssistantSpeaking(false);
-          setError("TTS provider browser_dev returned no text for browser speech synthesis.");
+      if (item.cancelled) return;
+
+      await new Promise<void>((resolve) => {
+        // Let the cancel mechanism resolve this promise early.
+        item.resolveCancel = resolve;
+
+        if (item.cancelled) {
+          resolve();
           return;
         }
-        playBrowserSpeech(result.text, transport, setAssistantSpeaking, setError, utteranceRef, stopCurrentSpeech);
-        return;
-      }
 
-      if (!result.audio_ref) {
-        setAssistantSpeaking(false);
-        setError(`TTS provider ${result.provider} returned no audio; browser speech synthesis is only allowed for browser_dev.`);
-        return;
-      }
-
-      let audioUrl: string | null = null;
-      try {
-        stopCurrentSpeech();
-        audioUrl = await createPlayableAudioUrl(result.audio_ref);
-        audioObjectUrlRef.current = audioUrl;
-        const audio = new Audio(audioUrl);
-        audioRef.current = audio;
-        audio.onplay = () => {
-          setError(null);
-          setAssistantSpeaking(true);
-          void transport.send({ event: "assistant_speech_started", metadata: { source: result.provider } });
-        };
-        audio.onended = () => {
-          cleanupAudioPlayback(audioUrl, audioRef, audioObjectUrlRef, setAssistantSpeaking);
-          void transport.send({ event: "assistant_speech_ended", metadata: { source: result.provider } });
-        };
-        audio.onerror = () => {
-          cleanupAudioPlayback(audioUrl, audioRef, audioObjectUrlRef, setAssistantSpeaking);
-          setError(`Browser TTS playback failed for ${result.provider}: ${describeMediaError(audio.error)}`);
-        };
-        await audio.play();
-      } catch (exc) {
-        cleanupAudioPlayback(audioUrl, audioRef, audioObjectUrlRef, setAssistantSpeaking);
-        setError(`Browser TTS playback failed for ${result.provider}: ${describePlaybackException(exc)}`);
-      }
+        if (result.audio_ref) {
+          void (async () => {
+            try {
+              const url = await createPlayableAudioUrl(result.audio_ref!);
+              if (item.cancelled) { URL.revokeObjectURL(url); resolve(); return; }
+              audioObjectUrlRef.current = url;
+              const a = new Audio(url);
+              audioRef.current = a;
+              a.onplay = () => {
+                setAssistantSpeaking(true);
+                void transport.send({ event: "assistant_speech_started", metadata: { source: "tts_queue" } });
+              };
+              const finish = () => {
+                setAssistantSpeaking(false);
+                audioRef.current = null;
+                if (audioObjectUrlRef.current === url) {
+                  URL.revokeObjectURL(url);
+                  audioObjectUrlRef.current = null;
+                }
+                void transport.send({ event: "assistant_speech_ended", metadata: { source: "tts_queue" } });
+                resolve();
+              };
+              a.onended = finish;
+              a.onerror = finish;
+              a.play().catch((exc) => {
+                setError(describePlaybackException(exc));
+                finish();
+              });
+            } catch (exc) {
+              setError(exc instanceof Error ? exc.message : "Audio decode failed");
+              resolve();
+            }
+          })();
+        } else if (result.text) {
+          // Browser speech synthesis fallback
+          if (!("speechSynthesis" in window)) {
+            setError("Browser speech synthesis not supported.");
+            resolve();
+            return;
+          }
+          const utterance = new SpeechSynthesisUtterance(result.text);
+          const voices = window.speechSynthesis.getVoices();
+          utterance.voice = voices.find((v) => v.lang.startsWith("en")) ?? voices[0] ?? null;
+          utterance.rate = 1;
+          utterance.pitch = 1;
+          utterance.volume = 1;
+          utteranceRef.current = utterance;
+          utterance.onstart = () => {
+            setAssistantSpeaking(true);
+            void transport.send({ event: "assistant_speech_started", metadata: { source: "speech_synthesis" } });
+          };
+          const finish = () => {
+            setAssistantSpeaking(false);
+            utteranceRef.current = null;
+            void transport.send({ event: "assistant_speech_ended", metadata: { source: "speech_synthesis" } });
+            resolve();
+          };
+          utterance.onend = finish;
+          utterance.onerror = (e) => {
+            setError(`Browser speech synthesis failed: ${e.error || "unknown"}`);
+            finish();
+          };
+          window.speechSynthesis.speak(utterance);
+          // Chromium quirk: kick synthesis if it stalls.
+          window.setTimeout(() => {
+            if (utteranceRef.current === utterance && !window.speechSynthesis.speaking) {
+              window.speechSynthesis.pause();
+              window.speechSynthesis.resume();
+            }
+          }, 250);
+        } else {
+          resolve();
+        }
+      });
     },
-    [stopCurrentSpeech, transport],
+    [transport],
   );
 
-  const handleOutboundVoiceEvents = useCallback((outbound: BrowserVoiceEvent[]) => {
-    if (!outbound.length) {
-      return;
-    }
-    setVoiceEvents((current) => [...outbound, ...current].slice(0, 20));
-    for (const event of outbound) {
-      if (event.event === "stop_assistant_audio") {
-        stopCurrentSpeech();
-      }
-      if (event.event === "transcript_partial") {
-        setPartialTranscript(event.text ?? null);
-      }
-      if (event.event === "transcript_final") {
-        setFinalTranscript(event.text ?? null);
-        setPartialTranscript(null);
-      }
-      if (event.event === "delivery_ready" || event.event === "assistant_response" || event.event === "task_status") {
-        if (event.text) {
-          void speakText(event.text);
+  const handleOutboundVoiceEvents = useCallback(
+    (outbound: BrowserVoiceEvent[]) => {
+      if (!outbound.length) return;
+      setVoiceEvents((current) => [...outbound, ...current].slice(0, 20));
+
+      for (const event of outbound) {
+        // ── Interrupt: flush the entire TTS queue immediately ──────────────────
+        if (
+          event.event === "stop_assistant_audio" ||
+          event.event === "speech_started"
+        ) {
+          flushTtsQueue();
+        }
+
+        if (event.event === "transcript_partial") {
+          setPartialTranscript(event.text ?? null);
+        }
+        if (event.event === "transcript_final") {
+          setFinalTranscript(event.text ?? null);
+          setPartialTranscript(null);
+        }
+        if (event.event === "assistant_speech_started") {
+          setAssistantSpeaking(true);
+        }
+        if (event.event === "assistant_speech_ended") {
+          setAssistantSpeaking(false);
+        }
+
+        // ── Enqueue TTS utterances ─────────────────────────────────────────────
+        // We ALWAYS use the local HTTP TTS path (playTtsItem → /tts/synthesize →
+        // <audio> element), even when WebRTC is active for mic input.
+        // Reason: WebRTC mic input gives us native AEC on the INPUT side.
+        // For OUTPUT, the reliable, already-working HTTP+audio path is used.
+        // The backend's WebRTC TTS output path (_poll_outbound_events) is too
+        // fragile — any ElevenLabs error silently kills the loop with no recovery.
+        if (
+          (event.event === "assistant_response" ||
+            event.event === "delivery_ready" ||
+            event.event === "task_status") &&
+          event.text
+        ) {
+          ttsQueue.current.enqueue(event.text, playTtsItem);
         }
       }
-    }
-  }, [speakText, stopCurrentSpeech]);
+    },
+    [flushTtsQueue, playTtsItem],
+  );
 
   const sendVoiceEvent = useCallback(
     async (event: VoiceEventInput) => {
+      // Flush the TTS queue the moment the user starts speaking — don't wait
+      // for the server round-trip.  This gives the earliest possible cancellation.
+      if (event.event === "speech_started" || event.event === "interruption") {
+        flushTtsQueue();
+      }
       try {
         const outbound = await transport.send(event);
         handleOutboundVoiceEvents(outbound);
@@ -235,7 +372,7 @@ export function App() {
         setError(exc instanceof Error ? exc.message : "Could not send voice event.");
       }
     },
-    [handleOutboundVoiceEvents, transport],
+    [flushTtsQueue, handleOutboundVoiceEvents, transport],
   );
 
   const mic = useMicrophone({ onVoiceEvent: sendVoiceEvent });
@@ -275,7 +412,14 @@ export function App() {
   }, [handleOutboundVoiceEvents, transport]);
 
   async function handleStartMic() {
-    await mic.start();
+    const stream = await mic.start();
+    if (stream) {
+      try {
+        await transport.connectWebRTC(stream);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to connect WebRTC");
+      }
+    }
   }
 
   async function handleDemoTask() {
@@ -314,8 +458,13 @@ export function App() {
     }
   }
 
-  function handleTestSpeech() {
-    void speakText("Speech output is working.");
+  async function handleTestSpeech() {
+    setError(null);
+    try {
+      await sendVoiceEvent({ event: "user_turn", text: "Please say 'This is a test of the text to speech system.'", metadata: { source: "test_speech_button" } });
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "Could not send test speech event.");
+    }
   }
 
   function handleStopSpeech() {

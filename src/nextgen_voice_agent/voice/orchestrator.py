@@ -49,6 +49,7 @@ class VoiceTimingConfig:
     token_overlap_threshold: float = 0.75
     fuzzy_similarity_threshold: float = 0.80
     short_transcript_max_words: int = 3
+    assistant_ack_timeout_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -112,6 +113,7 @@ class VoiceSessionOrchestrator:
         self.timing = timing or VoiceTimingConfig()
         self.clock = clock or datetime.now
         self.sessions: dict[str, VoiceSessionState] = {}
+        self.event_listeners: set[Callable[[str, VoiceEvent], None]] = set()
 
     async def start_session(self, session_id: str, transport_kind: VoiceTransportKind) -> VoiceSessionState:
         existing = self.sessions.get(session_id)
@@ -239,6 +241,12 @@ class VoiceSessionOrchestrator:
     async def _handle_user_turn(self, state: VoiceSessionState, text: str) -> None:
         state.last_user_turn_at = self.clock()
         normalized = text.strip().lower()
+
+        # A new user turn invalidates any result that was sitting in the delivery
+        # queue but hadn't been spoken yet.  This prevents the old delivery_ready
+        # utterance from racing with (or playing after) the new acknowledgement.
+        if state.queued_result is not None:
+            state.queued_result = None
 
         if state.active_task_id and any(phrase in normalized for phrase in ["cancel", "stop", "forget that"]):
             await self.controller.cancel_task(state.active_task_id, CancelTaskRequest(reason=text))
@@ -450,6 +458,14 @@ class VoiceSessionOrchestrator:
         result = state.queued_result
         if result is None or state.user_speaking or state.assistant_speaking:
             return
+
+        if self.timing.assistant_ack_timeout_ms > 0 and state.recent_assistant_utterances:
+            last_emitted_at, _ = state.recent_assistant_utterances[-1]
+            if state.assistant_speech_started_at is None or state.assistant_speech_started_at < last_emitted_at:
+                elapsed = self._elapsed_ms(last_emitted_at)
+                if elapsed < self.timing.assistant_ack_timeout_ms:
+                    return
+
         if state.delivered_result_generation == result.generation:
             return
 
@@ -475,16 +491,23 @@ class VoiceSessionOrchestrator:
         }
         if metadata:
             event_metadata.update(metadata)
-        await state.outbound.put(
-            VoiceEvent(
-                event=event_type,
-                transport=state.transport,
-                session_id=state.session_id,
-                text=text,
-                task_id=task_id,
-                metadata=event_metadata,
-            )
+        event = VoiceEvent(
+            event=event_type,
+            transport=state.transport,
+            session_id=state.session_id,
+            text=text,
+            task_id=task_id,
+            metadata=event_metadata,
         )
+        await state.outbound.put(event)
+        
+        # Notify listener callbacks
+        for listener in self.event_listeners:
+            try:
+                listener(state.session_id, event)
+            except Exception:
+                pass
+
         if event_type in {VoiceEventType.ASSISTANT_RESPONSE, VoiceEventType.DELIVERY_READY, VoiceEventType.TASK_STATUS}:
             self._remember_assistant_utterance(state, text)
 

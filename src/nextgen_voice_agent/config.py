@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     nvidia_magpie_language_code: str = "en-US"
     nvidia_magpie_sample_rate_hz: int = 22050
 
+    elevenlabs_api_key: SecretStr | None = Field(default=None, validation_alias=AliasChoices("NVA_ELEVENLABS_API_KEY", "ELEVENLABS_API_KEY"))
+    elevenlabs_voice_id: str = "ErXwobaYiN019PkySvjV"
+    elevenlabs_model_id: str = "eleven_multilingual_v2"
+    elevenlabs_output_format: str = "mp3_44100_128"
+
     model_config = SettingsConfigDict(env_prefix="NVA_", env_file=".env", extra="ignore")
 
 

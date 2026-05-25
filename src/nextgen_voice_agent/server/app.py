@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from nextgen_voice_agent.config import get_settings
 from nextgen_voice_agent.server.dependencies import create_controller, create_stt, create_tts
 from nextgen_voice_agent.server import routes, websocket
-from nextgen_voice_agent.voice.orchestrator import VoiceSessionOrchestrator
+from nextgen_voice_agent.voice.orchestrator import VoiceSessionOrchestrator, VoiceTimingConfig
 from nextgen_voice_agent.voice.stt import parse_asr_mode
 
 
@@ -20,6 +20,7 @@ def create_app() -> FastAPI:
         app.state.controller,
         stt_provider=app.state.stt_provider,
         requested_asr_mode=parse_asr_mode(settings.asr_mode),
+        timing=VoiceTimingConfig(assistant_ack_timeout_ms=2000),
     )
     app.add_middleware(
         CORSMiddleware,
