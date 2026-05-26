@@ -44,11 +44,13 @@ class CodexCliRuntime(TaskRuntime):
     def __init__(
         self,
         command: str = "codex",
+        model: str | None = None,
         config: CodexCliRuntimeConfig | None = None,
         process_factory: ProcessFactory | None = None,
         schema_path: Path | None = None,
     ) -> None:
         self.command = command
+        self.model = model
         self.config = config or CodexCliRuntimeConfig()
         self.process_factory = process_factory or asyncio.create_subprocess_exec
         self.schema_path = schema_path or self._default_schema_path()
@@ -121,17 +123,24 @@ class CodexCliRuntime(TaskRuntime):
         await self._terminate_process(task_id, process)
 
     async def _start_process(self, request: RuntimeTaskRequest, result_path: Path) -> asyncio.subprocess.Process:
+        command_args = [
+            self.command,
+            "-a",
+            "never",
+            "exec",
+            "--skip-git-repo-check",
+            "--output-schema",
+            str(self.schema_path),
+            "-o",
+            str(result_path),
+        ]
+        if self.model:
+            command_args.extend(["-m", self.model])
+        command_args.append(request.prompt)
         try:
             return await asyncio.wait_for(
                 self.process_factory(
-                    self.command,
-                    "exec",
-                    "--skip-git-repo-check",
-                    "--output-schema",
-                    str(self.schema_path),
-                    "-o",
-                    str(result_path),
-                    request.prompt,
+                    *command_args,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 ),

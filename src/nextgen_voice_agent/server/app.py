@@ -10,7 +10,10 @@ from nextgen_voice_agent.voice.orchestrator import VoiceSessionOrchestrator, Voi
 from nextgen_voice_agent.voice.stt import parse_asr_mode
 
 
+from dotenv import load_dotenv
+
 def create_app() -> FastAPI:
+    load_dotenv()
     settings = get_settings()
     app = FastAPI(title=settings.app_name)
     app.state.controller = create_controller(settings)

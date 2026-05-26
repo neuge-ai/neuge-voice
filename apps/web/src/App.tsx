@@ -31,6 +31,7 @@ type TtsQueueItem = {
 
 class TtsPlaybackQueue {
   private queue: TtsQueueItem[] = [];
+  private currentItem: TtsQueueItem | null = null;
   private running = false;
 
   /** Add a text utterance to the back of the queue and start draining if idle. */
@@ -47,6 +48,10 @@ class TtsPlaybackQueue {
 
   /** Cancel all queued and currently-playing utterances immediately. */
   flush(): void {
+    if (this.currentItem) {
+      this.currentItem.cancelled = true;
+      this.currentItem.resolveCancel();
+    }
     for (const item of this.queue) {
       item.cancelled = true;
       item.resolveCancel();
@@ -56,13 +61,23 @@ class TtsPlaybackQueue {
 
   private async drain(play: (item: TtsQueueItem) => Promise<void>): Promise<void> {
     this.running = true;
-    while (this.queue.length > 0) {
-      const item = this.queue.shift()!;
-      if (!item.cancelled) {
-        await play(item);
+    try {
+      while (this.queue.length > 0) {
+        const item = this.queue.shift()!;
+        this.currentItem = item;
+        try {
+          if (!item.cancelled) {
+            await play(item);
+          }
+        } finally {
+          if (this.currentItem === item) {
+            this.currentItem = null;
+          }
+        }
       }
+    } finally {
+      this.running = false;
     }
-    this.running = false;
   }
 }
 
@@ -225,11 +240,18 @@ export function App() {
       if (item.cancelled) return;
 
       await new Promise<void>((resolve) => {
+        let resolved = false;
+        const resolveOnce = () => {
+          if (resolved) return;
+          resolved = true;
+          resolve();
+        };
+
         // Let the cancel mechanism resolve this promise early.
-        item.resolveCancel = resolve;
+        item.resolveCancel = resolveOnce;
 
         if (item.cancelled) {
-          resolve();
+          resolveOnce();
           return;
         }
 
@@ -237,7 +259,7 @@ export function App() {
           void (async () => {
             try {
               const url = await createPlayableAudioUrl(result.audio_ref!);
-              if (item.cancelled) { URL.revokeObjectURL(url); resolve(); return; }
+              if (item.cancelled) { URL.revokeObjectURL(url); resolveOnce(); return; }
               audioObjectUrlRef.current = url;
               const a = new Audio(url);
               a.crossOrigin = "anonymous";
@@ -249,6 +271,7 @@ export function App() {
                 void transport.send({ event: "assistant_speech_started", metadata: { source: "tts_queue" } });
               };
               const finish = () => {
+                if (resolved) return;
                 setAssistantSpeaking(false);
                 audioRef.current = null;
                 if (audioObjectUrlRef.current === url) {
@@ -256,8 +279,9 @@ export function App() {
                   audioObjectUrlRef.current = null;
                 }
                 void transport.send({ event: "assistant_speech_ended", metadata: { source: "tts_queue" } });
-                resolve();
+                resolveOnce();
               };
+              item.resolveCancel = finish;
               a.onended = finish;
               a.onerror = finish;
               a.play().catch((exc) => {
@@ -266,14 +290,14 @@ export function App() {
               });
             } catch (exc) {
               setError(exc instanceof Error ? exc.message : "Audio decode failed");
-              resolve();
+              resolveOnce();
             }
           })();
         } else if (result.text) {
           // Browser speech synthesis fallback
           if (!("speechSynthesis" in window)) {
             setError("Browser speech synthesis not supported.");
-            resolve();
+            resolveOnce();
             return;
           }
           const utterance = new SpeechSynthesisUtterance(result.text);
@@ -288,11 +312,13 @@ export function App() {
             void transport.send({ event: "assistant_speech_started", metadata: { source: "speech_synthesis" } });
           };
           const finish = () => {
+            if (resolved) return;
             setAssistantSpeaking(false);
             utteranceRef.current = null;
             void transport.send({ event: "assistant_speech_ended", metadata: { source: "speech_synthesis" } });
-            resolve();
+            resolveOnce();
           };
+          item.resolveCancel = finish;
           utterance.onend = finish;
           utterance.onerror = (e) => {
             setError(`Browser speech synthesis failed: ${e.error || "unknown"}`);
@@ -307,7 +333,7 @@ export function App() {
             }
           }, 250);
         } else {
-          resolve();
+          resolveOnce();
         }
       });
     },

@@ -69,7 +69,7 @@ async def test_orchestrator_delivers_task_result_only_when_idle() -> None:
 @pytest.mark.asyncio
 async def test_orchestrator_routes_cancel_turn_to_controller() -> None:
     controller = AgentController(runtime=FakeRuntime(delay_seconds=1.0))
-    orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10))
+    orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10, turn_commit_default_wait_ms=0, turn_commit_active_task_wait_ms=0, turn_commit_hard_command_wait_ms=0))
     session_id = "browser-session"
 
     await orchestrator.handle_voice_event(
@@ -99,9 +99,86 @@ async def test_orchestrator_routes_cancel_turn_to_controller() -> None:
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_speaks_router_acknowledgement_for_voice_task() -> None:
+    class RouterWithAcknowledgement:
+        async def route_turn(self, user_text, system_state, conversation_history):
+            return {
+                "type": "tool_call",
+                "tool": "start_task",
+                "arguments": {"task": user_text},
+                "assistant_response": "I'll check that now.",
+            }
+
+    controller = AgentController(runtime=FakeRuntime(delay_seconds=1.0))
+    orchestrator = VoiceSessionOrchestrator(
+        controller=controller,
+        llm_provider=RouterWithAcknowledgement(),
+        timing=VoiceTimingConfig(control_loop_ms=10),
+    )
+    session_id = "browser-session"
+
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(
+            event=VoiceEventType.USER_TURN,
+            transport=VoiceTransportKind.BROWSER,
+            session_id=session_id,
+            text="Check weather in Delhi tomorrow.",
+        ),
+    )
+    events = await orchestrator.drain_events(session_id)
+
+    assistant_events = [event for event in events if event.event == VoiceEventType.ASSISTANT_RESPONSE]
+    assert assistant_events[-1].text == "I'll check that now."
+    assert "Sure, I will work on" not in assistant_events[-1].text
+    assert orchestrator.sessions[session_id].active_task_id is not None
+    assert next(iter(controller.tasks.values())).original_request == "Check weather in Delhi tomorrow."
+    await orchestrator.stop_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_delivers_supervisor_composed_tool_result() -> None:
+    class ComposingRouter:
+        async def route_turn(self, user_text, system_state, conversation_history):
+            return {
+                "type": "tool_call",
+                "tool": "start_task",
+                "arguments": {"task": user_text},
+                "assistant_response": "I'll check that now.",
+            }
+
+        async def compose_tool_result(self, user_text, system_state, conversation_history, result):
+            return f"Composed answer for: {result.spoken_answer}"
+
+    controller = AgentController(runtime=FakeRuntime(delay_seconds=0.01))
+    orchestrator = VoiceSessionOrchestrator(
+        controller=controller,
+        llm_provider=ComposingRouter(),
+        timing=VoiceTimingConfig(control_loop_ms=10, first_thinking_ack_ms=5000, first_tool_status_ms=5000),
+    )
+    session_id = "browser-session"
+
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(
+            event=VoiceEventType.USER_TURN,
+            transport=VoiceTransportKind.BROWSER,
+            session_id=session_id,
+            text="Check demo weather.",
+        ),
+    )
+
+    delivered = await wait_for_voice_event(orchestrator, session_id, VoiceEventType.DELIVERY_READY)
+
+    assert delivered.text == "Composed answer for: Demo result for: Check demo weather."
+    assert any(msg.get("role") == "tool" and msg.get("tool_call_id", "").startswith("result_") for msg in orchestrator.sessions[session_id].conversation_history)
+    await orchestrator.stop_session(session_id)
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_rejects_recent_assistant_echo_as_asr_user_turn() -> None:
     controller = AgentController(runtime=FakeRuntime(delay_seconds=0.01))
-    orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10))
+    orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10, turn_commit_default_wait_ms=0, turn_commit_active_task_wait_ms=0, turn_commit_hard_command_wait_ms=0))
     session_id = "browser-session"
     state = await orchestrator.start_session(session_id, VoiceTransportKind.BROWSER)
 
@@ -128,7 +205,7 @@ async def test_orchestrator_rejects_recent_assistant_echo_as_asr_user_turn() -> 
 @pytest.mark.asyncio
 async def test_orchestrator_rejects_short_prefix_echo_after_assistant_speech() -> None:
     controller = AgentController(runtime=FakeRuntime(delay_seconds=0.01))
-    orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10))
+    orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10, turn_commit_default_wait_ms=0, turn_commit_active_task_wait_ms=0, turn_commit_hard_command_wait_ms=0))
     session_id = "browser-session"
     state = await orchestrator.start_session(session_id, VoiceTransportKind.BROWSER)
 
@@ -151,7 +228,7 @@ async def test_orchestrator_rejects_short_prefix_echo_after_assistant_speech() -
 @pytest.mark.asyncio
 async def test_orchestrator_rejects_soft_marker_only_after_assistant_speech() -> None:
     controller = AgentController(runtime=FakeRuntime(delay_seconds=0.01))
-    orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10))
+    orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10, turn_commit_default_wait_ms=0, turn_commit_active_task_wait_ms=0, turn_commit_hard_command_wait_ms=0))
     session_id = "browser-session"
     state = await orchestrator.start_session(session_id, VoiceTransportKind.BROWSER)
 
@@ -174,7 +251,7 @@ async def test_orchestrator_rejects_soft_marker_only_after_assistant_speech() ->
 @pytest.mark.asyncio
 async def test_orchestrator_accepts_soft_marker_with_payload_when_not_echo() -> None:
     controller = AgentController(runtime=FakeRuntime(delay_seconds=0.01))
-    orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10))
+    orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10, turn_commit_default_wait_ms=0, turn_commit_active_task_wait_ms=0, turn_commit_hard_command_wait_ms=0))
     session_id = "browser-session"
     state = await orchestrator.start_session(session_id, VoiceTransportKind.BROWSER)
 
@@ -197,7 +274,7 @@ async def test_orchestrator_accepts_soft_marker_with_payload_when_not_echo() -> 
 @pytest.mark.asyncio
 async def test_orchestrator_allows_hard_interrupt_command_unless_echoed() -> None:
     controller = AgentController(runtime=FakeRuntime(delay_seconds=1.0))
-    orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10))
+    orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10, turn_commit_default_wait_ms=0, turn_commit_active_task_wait_ms=0, turn_commit_hard_command_wait_ms=0))
     session_id = "browser-session"
     state = await orchestrator.start_session(session_id, VoiceTransportKind.BROWSER)
 
@@ -223,7 +300,7 @@ async def test_orchestrator_allows_hard_interrupt_command_unless_echoed() -> Non
 @pytest.mark.asyncio
 async def test_orchestrator_rejects_hard_command_when_it_matches_recent_assistant_text() -> None:
     controller = AgentController(runtime=FakeRuntime(delay_seconds=1.0))
-    orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10))
+    orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10, turn_commit_default_wait_ms=0, turn_commit_active_task_wait_ms=0, turn_commit_hard_command_wait_ms=0))
     session_id = "browser-session"
     state = await orchestrator.start_session(session_id, VoiceTransportKind.BROWSER)
 
@@ -289,7 +366,7 @@ async def test_orchestrator_rejects_short_echo_during_post_tts_cooldown() -> Non
 @pytest.mark.asyncio
 async def test_speech_started_during_assistant_speech_enters_barge_in_candidate_without_stopping_audio() -> None:
     controller = AgentController(runtime=FakeRuntime(delay_seconds=0.01))
-    orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10))
+    orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10, turn_commit_default_wait_ms=0, turn_commit_active_task_wait_ms=0, turn_commit_hard_command_wait_ms=0))
     session_id = "browser-session"
     state = await orchestrator.start_session(session_id, VoiceTransportKind.BROWSER)
 
@@ -297,7 +374,7 @@ async def test_speech_started_during_assistant_speech_enters_barge_in_candidate_
         session_id,
         VoiceEvent(event=VoiceEventType.ASSISTANT_SPEECH_STARTED, transport=VoiceTransportKind.BROWSER, session_id=session_id),
     )
-    events = await orchestrator.handle_voice_event(
+    await orchestrator.handle_voice_event(
         session_id,
         VoiceEvent(
             event=VoiceEventType.SPEECH_STARTED,
@@ -306,6 +383,7 @@ async def test_speech_started_during_assistant_speech_enters_barge_in_candidate_
             metadata={"speech_segment_id": "barge"},
         ),
     )
+    events = await orchestrator.drain_events(session_id)
 
     assert state.voice_state == VoiceTurnState.BARGE_IN_CANDIDATE
     assert state.assistant_speaking is True
@@ -316,7 +394,7 @@ async def test_speech_started_during_assistant_speech_enters_barge_in_candidate_
 @pytest.mark.asyncio
 async def test_accepted_barge_in_stops_assistant_audio_and_processes_turn() -> None:
     controller = AgentController(runtime=FakeRuntime(delay_seconds=0.01))
-    orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10))
+    orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10, turn_commit_default_wait_ms=0, turn_commit_active_task_wait_ms=0, turn_commit_hard_command_wait_ms=0))
     session_id = "browser-session"
     state = await orchestrator.start_session(session_id, VoiceTransportKind.BROWSER)
 
@@ -343,6 +421,21 @@ async def test_accepted_barge_in_stops_assistant_audio_and_processes_turn() -> N
         ),
     )
 
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(
+            event=VoiceEventType.SPEECH_ENDED,
+            transport=VoiceTransportKind.BROWSER,
+            session_id=session_id,
+            metadata={"speech_segment_id": "barge"},
+        ),
+    )
+    import asyncio
+    for _ in range(50):
+        if state.active_task_id is not None:
+            break
+        await asyncio.sleep(0.01)
+
     events = await orchestrator.drain_events(session_id)
     assert any(event.event == VoiceEventType.STOP_ASSISTANT_AUDIO for event in events)
     assert state.assistant_speaking is False
@@ -354,7 +447,7 @@ async def test_accepted_barge_in_stops_assistant_audio_and_processes_turn() -> N
 @pytest.mark.asyncio
 async def test_rejected_barge_in_does_not_start_task_or_stop_assistant_audio() -> None:
     controller = AgentController(runtime=FakeRuntime(delay_seconds=0.01))
-    orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10))
+    orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10, turn_commit_default_wait_ms=0, turn_commit_active_task_wait_ms=0, turn_commit_hard_command_wait_ms=0))
     session_id = "browser-session"
     state = await orchestrator.start_session(session_id, VoiceTransportKind.BROWSER)
 
@@ -390,13 +483,13 @@ async def test_orchestrator_blocks_delivery_during_assistant_ack_timeout() -> No
     controller = AgentController(runtime=FakeRuntime(delay_seconds=0.005))
     orchestrator = VoiceSessionOrchestrator(
         controller=controller,
-        timing=VoiceTimingConfig(control_loop_ms=10, assistant_ack_timeout_ms=500),
+        timing=VoiceTimingConfig(control_loop_ms=10, assistant_ack_timeout_ms=500, turn_commit_default_wait_ms=0, turn_commit_active_task_wait_ms=0, turn_commit_hard_command_wait_ms=0),
     )
     session_id = "browser-session"
     state = await orchestrator.start_session(session_id, VoiceTransportKind.BROWSER)
 
     # 1. Trigger user turn
-    init_events = await orchestrator.handle_voice_event(
+    await orchestrator.handle_voice_event(
         session_id,
         VoiceEvent(
             event=VoiceEventType.USER_TURN,
@@ -405,6 +498,7 @@ async def test_orchestrator_blocks_delivery_during_assistant_ack_timeout() -> No
             text="Trigger fast task.",
         ),
     )
+    init_events = await orchestrator.drain_events(session_id)
 
     # Allow task to finish, control loop will poll and see the queued result.
     # However, since client hasn't started speaking the acknowledgement (no ASSISTANT_SPEECH_STARTED),
@@ -442,4 +536,3 @@ async def test_orchestrator_blocks_delivery_during_assistant_ack_timeout() -> No
     delivered = await wait_for_voice_event(orchestrator, session_id, VoiceEventType.DELIVERY_READY)
     assert delivered is not None
     await orchestrator.stop_session(session_id)
-
