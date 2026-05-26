@@ -1,4 +1,4 @@
-import { type Dispatch, type MutableRefObject, type SetStateAction, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   cancelTask,
@@ -26,7 +26,7 @@ import { useMicrophone } from "./realtime/useMicrophone";
 type TtsQueueItem = {
   text: string;
   cancelled: boolean;
-  resolveCancel: () => void;
+  cancel: () => void;
 };
 
 class TtsPlaybackQueue {
@@ -39,7 +39,7 @@ class TtsPlaybackQueue {
     text: string,
     play: (item: TtsQueueItem) => Promise<void>,
   ): void {
-    const item: TtsQueueItem = { text, cancelled: false, resolveCancel: () => {} };
+    const item: TtsQueueItem = { text, cancelled: false, cancel: () => {} };
     this.queue.push(item);
     if (!this.running) {
       void this.drain(play);
@@ -50,11 +50,11 @@ class TtsPlaybackQueue {
   flush(): void {
     if (this.currentItem) {
       this.currentItem.cancelled = true;
-      this.currentItem.resolveCancel();
+      this.currentItem.cancel();
     }
     for (const item of this.queue) {
       item.cancelled = true;
-      item.resolveCancel();
+      item.cancel();
     }
     this.queue = [];
   }
@@ -119,66 +119,6 @@ function describePlaybackException(exc: unknown): string {
   return "the browser rejected playback.";
 }
 
-function cleanupAudioPlayback(
-  audioUrl: string | null,
-  audioRef: MutableRefObject<HTMLAudioElement | null>,
-  audioObjectUrlRef: MutableRefObject<string | null>,
-  setAssistantSpeaking: Dispatch<SetStateAction<boolean>>,
-) {
-  audioRef.current?.pause();
-  audioRef.current = null;
-  if (audioUrl && audioObjectUrlRef.current === audioUrl) {
-    URL.revokeObjectURL(audioUrl);
-    audioObjectUrlRef.current = null;
-  }
-  setAssistantSpeaking(false);
-}
-
-function playBrowserSpeech(
-  text: string,
-  transport: BrowserVoiceTransport,
-  setAssistantSpeaking: Dispatch<SetStateAction<boolean>>,
-  setError: Dispatch<SetStateAction<string | null>>,
-  utteranceRef: MutableRefObject<SpeechSynthesisUtterance | null>,
-  stopCurrentSpeech: () => void,
-) {
-  if (!("speechSynthesis" in window) || !("SpeechSynthesisUtterance" in window)) {
-    setAssistantSpeaking(false);
-    setError("This browser does not support local speech synthesis playback.");
-    return;
-  }
-  stopCurrentSpeech();
-  const utterance = new SpeechSynthesisUtterance(text);
-  const voices = window.speechSynthesis.getVoices();
-  utterance.voice = voices.find((voice) => voice.lang.startsWith("en")) ?? voices[0] ?? null;
-  utterance.rate = 1;
-  utterance.pitch = 1;
-  utterance.volume = 1;
-  utteranceRef.current = utterance;
-  utterance.onstart = () => {
-    setError(null);
-    setAssistantSpeaking(true);
-    void transport.send({ event: "assistant_speech_started", metadata: { source: "speech_synthesis" } });
-  };
-  utterance.onend = () => {
-    setAssistantSpeaking(false);
-    utteranceRef.current = null;
-    void transport.send({ event: "assistant_speech_ended", metadata: { source: "speech_synthesis" } });
-  };
-  utterance.onerror = (speechError) => {
-    setAssistantSpeaking(false);
-    utteranceRef.current = null;
-    setError(`Browser speech synthesis failed: ${speechError.error || "unknown speech synthesis error"}.`);
-  };
-  window.speechSynthesis.speak(utterance);
-  window.setTimeout(() => {
-    if (utteranceRef.current === utterance && !window.speechSynthesis.speaking) {
-      window.speechSynthesis.pause();
-      window.speechSynthesis.resume();
-    }
-  }, 250);
-}
-
 export function App() {
   const transport = useMemo(() => new BrowserVoiceTransport(), []);
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
@@ -201,18 +141,6 @@ export function App() {
   /** Cancel every queued/in-flight TTS utterance immediately. */
   const flushTtsQueue = useCallback(() => {
     ttsQueue.current.flush();
-    // Stop any <audio> element currently playing.
-    audioRef.current?.pause();
-    audioRef.current = null;
-    if (audioObjectUrlRef.current) {
-      URL.revokeObjectURL(audioObjectUrlRef.current);
-      audioObjectUrlRef.current = null;
-    }
-    // Stop any browser speech synthesis utterance.
-    if (utteranceRef.current) {
-      window.speechSynthesis?.cancel();
-      utteranceRef.current = null;
-    }
     setAssistantSpeaking(false);
     void transport.send({ event: "assistant_speech_ended", metadata: { source: "flush" } });
   }, [transport]);
@@ -230,9 +158,26 @@ export function App() {
       if (item.cancelled) return;
 
       let result: Awaited<ReturnType<typeof synthesizeSpeech>>;
+      const abortController = new AbortController();
+      const cancelledBeforePlayback = new Promise<"cancelled">((resolve) => {
+        let cancelResolved = false;
+        item.cancel = () => {
+          if (cancelResolved) return;
+          cancelResolved = true;
+          item.cancelled = true;
+          abortController.abort();
+          resolve("cancelled");
+        };
+      });
       try {
-        result = await synthesizeSpeech(item.text);
+        const synthesis = await Promise.race([
+          synthesizeSpeech(item.text, abortController.signal),
+          cancelledBeforePlayback,
+        ]);
+        if (synthesis === "cancelled") return;
+        result = synthesis;
       } catch (exc) {
+        if (item.cancelled || abortController.signal.aborted) return;
         setError(exc instanceof Error ? exc.message : "TTS failed");
         return;
       }
@@ -247,8 +192,8 @@ export function App() {
           resolve();
         };
 
-        // Let the cancel mechanism resolve this promise early.
-        item.resolveCancel = resolveOnce;
+        // Before media exists, cancellation only needs to unblock the queue.
+        item.cancel = resolveOnce;
 
         if (item.cancelled) {
           resolveOnce();
@@ -281,7 +226,13 @@ export function App() {
                 void transport.send({ event: "assistant_speech_ended", metadata: { source: "tts_queue" } });
                 resolveOnce();
               };
-              item.resolveCancel = finish;
+              item.cancel = () => {
+                if (resolved) return;
+                a.pause();
+                a.removeAttribute("src");
+                a.load();
+                finish();
+              };
               a.onended = finish;
               a.onerror = finish;
               a.play().catch((exc) => {
@@ -318,7 +269,11 @@ export function App() {
             void transport.send({ event: "assistant_speech_ended", metadata: { source: "speech_synthesis" } });
             resolveOnce();
           };
-          item.resolveCancel = finish;
+          item.cancel = () => {
+            if (resolved) return;
+            window.speechSynthesis.cancel();
+            finish();
+          };
           utterance.onend = finish;
           utterance.onerror = (e) => {
             setError(`Browser speech synthesis failed: ${e.error || "unknown"}`);
