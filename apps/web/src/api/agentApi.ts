@@ -109,11 +109,12 @@ export async function getHealthStatus(): Promise<HealthStatus> {
   return response.json();
 }
 
-export async function synthesizeSpeech(text: string): Promise<TtsResult> {
+export async function synthesizeSpeech(text: string, signal?: AbortSignal): Promise<TtsResult> {
   const response = await fetch(`${API_BASE}/tts/synthesize`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ text }),
+    signal,
   });
   if (!response.ok) {
     throw new Error(await formatApiError(response, "Backend TTS synthesis failed"));
