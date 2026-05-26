@@ -30,6 +30,15 @@ def test_router_tools_exclude_answer_directly() -> None:
     assert tool_names == {"start_task", "amend_task", "cancel_task"}
 
 
+def test_start_task_tool_description_requires_grounded_followups() -> None:
+    start_task_tool = next(tool for tool in ROUTER_TOOLS if tool["function"]["name"] == "start_task")
+
+    description = start_task_tool["function"]["description"]
+    assert "follow-up requests" in description
+    assert "prior facts" in description
+    assert "missing/new information" in description
+
+
 def test_sanitize_user_facing_text_removes_thinking_blocks() -> None:
     assert sanitize_user_facing_text("<think>reasoning</think> Delhi is hot.") == "Delhi is hot."
     assert sanitize_user_facing_text("Delhi is hot. <think>extra</think>") == "Delhi is hot."
@@ -54,6 +63,9 @@ async def test_router_returns_assistant_content_without_tool(mock_litellm_acompl
 
     assert decision == {"type": "assistant_response", "response": "Hello."}
     assert mock_litellm_acompletion.call_args.kwargs["tool_choice"] == "auto"
+    system_prompt = mock_litellm_acompletion.call_args.kwargs["messages"][0]["content"]
+    assert "inspect the conversation history" in system_prompt
+    assert "preserve it and ask the tool only for missing/new information" in system_prompt
 
 
 @pytest.mark.asyncio

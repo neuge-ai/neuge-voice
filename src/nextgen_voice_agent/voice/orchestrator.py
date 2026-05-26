@@ -328,9 +328,9 @@ class VoiceSessionOrchestrator:
             try:
                 task_text = args.get("task", text)
                 assistant_response = (decision.get("assistant_response") or "").strip() or "I'll start that now."
-                context = "Conversation History:\n" + "\n".join(
-                    [f"{msg['role'].capitalize()}: {msg.get('content', str(msg))}" for msg in state.conversation_history]
-                )
+                context = self._build_task_context(state, text)
+                logging.info("Voice router starting task with grounded request: %s", task_text)
+                logging.debug("Voice task context for Codex:\n%s", context)
                 response = await self.controller.start_task(StartTaskRequest(task=task_text, context=context))
                 
                 state.active_task_id = response.task.task_id
@@ -642,6 +642,35 @@ class VoiceSessionOrchestrator:
             "name": "start_task",
             "content": json.dumps(result.model_dump(mode="json")),
         })
+
+    def _build_task_context(self, state: VoiceSessionState, current_user_text: str) -> str:
+        prior_results: list[dict[str, Any]] = []
+        transcript_lines: list[str] = []
+        for msg in state.conversation_history:
+            role = msg.get("role")
+            content = msg.get("content")
+            if role == "tool" and msg.get("name") == "start_task" and isinstance(content, str):
+                try:
+                    payload = json.loads(content)
+                except json.JSONDecodeError:
+                    transcript_lines.append(f"Tool: {content}")
+                    continue
+                if isinstance(payload, dict) and "status" in payload:
+                    prior_results.append(payload)
+                    continue
+            if role == "assistant" and "tool_calls" in msg:
+                transcript_lines.append(f"Assistant tool call: {json.dumps(msg.get('tool_calls'))}")
+            elif content is not None:
+                transcript_lines.append(f"{str(role or 'message').capitalize()}: {content}")
+
+        sections = ["Current user request:", current_user_text]
+        if prior_results:
+            sections.append("\nPrior completed tool results to preserve when relevant:")
+            for index, result in enumerate(prior_results, start=1):
+                sections.append(f"Prior result {index}: {json.dumps(result)}")
+        sections.append("\nConversation transcript:")
+        sections.extend(transcript_lines or ["No previous conversation turns."])
+        return "\n".join(sections)
 
     async def _emit(
         self,
