@@ -32,7 +32,7 @@ async def test_start_task_completes_with_fake_runtime() -> None:
     response = await controller.start_task(StartTaskRequest(task="Check this week's weather."))
     task_id = response.task.task_id
 
-    assert response.acknowledgement.startswith("Sure")
+    assert response.acknowledgement == "I'll look into that in the background."
     await wait_for_status(controller, task_id, TaskStatus.COMPLETED)
 
     result = controller.read_result(task_id)
@@ -88,3 +88,23 @@ async def test_cancel_task_ignores_late_output() -> None:
         )
     )
     assert controller.read_result(task_id) is None
+
+
+@pytest.mark.asyncio
+async def test_failed_runtime_result_clears_active_task() -> None:
+    controller = AgentController(runtime=FakeRuntime(delay_seconds=1.0))
+    response = await controller.start_task(StartTaskRequest(task="Check weather."))
+    task_id = response.task.task_id
+
+    await controller._handle_result(
+        RuntimeResult(
+            task_id=task_id,
+            generation=1,
+            status=RuntimeResultStatus.FAILED,
+            error="Codex completed without writing the structured result file.",
+        )
+    )
+
+    assert controller.active_task_id is None
+    assert controller.get_status(task_id).task.status == TaskStatus.FAILED
+    assert controller.event_hub.history[-1].event == EventType.TASK_FAILED

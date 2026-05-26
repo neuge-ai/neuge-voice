@@ -24,10 +24,21 @@ def _completion_message(content: str | None = None, tool_name: str | None = None
     return response
 
 
-def test_router_tools_exclude_answer_directly() -> None:
+def test_router_tools_include_codex_and_native_tools_but_exclude_answer_directly() -> None:
     tool_names = {tool["function"]["name"] for tool in ROUTER_TOOLS}
 
-    assert tool_names == {"start_task", "amend_task", "cancel_task"}
+    assert "answer_directly" not in tool_names
+    assert tool_names >= {
+        "start_task",
+        "amend_task",
+        "cancel_task",
+        "start_timer",
+        "get_timer_status",
+        "start_activity",
+        "get_activity_status",
+        "end_activity",
+        "get_background_task_status",
+    }
 
 
 def test_start_task_tool_description_requires_grounded_followups() -> None:
@@ -66,6 +77,10 @@ async def test_router_returns_assistant_content_without_tool(mock_litellm_acompl
     system_prompt = mock_litellm_acompletion.call_args.kwargs["messages"][0]["content"]
     assert "inspect the conversation history" in system_prompt
     assert "preserve it and ask the tool only for missing/new information" in system_prompt
+    assert "STATE AND PLAUSIBILITY CHECKS" in system_prompt
+    assert "Only one Codex/background task may run at a time" in system_prompt
+    assert "five mile run" in system_prompt
+    assert "five-minute run" in system_prompt
 
 
 @pytest.mark.asyncio
@@ -103,7 +118,7 @@ async def test_router_falls_back_when_tool_call_has_no_assistant_content(mock_li
         "type": "tool_call",
         "tool": "start_task",
         "arguments": {"task": "Check the weather."},
-        "assistant_response": "I'll start that now.",
+        "assistant_response": "I'll look into that.",
     }
 
 

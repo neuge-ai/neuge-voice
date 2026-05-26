@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -65,6 +66,7 @@ class CodexCliRuntime(TaskRuntime):
             result_path = Path(tmp_dir) / "runtime-result.json"
             process = await self._start_process(request, result_path)
             self._processes[request.task_id] = process
+            logging.info("Codex CLI started for task %s with pid %s", request.task_id, getattr(process, "pid", None))
             yield self._progress(request, CodexRuntimeState.RUNNING, "Codex CLI process is running.")
 
             try:
@@ -88,6 +90,11 @@ class CodexCliRuntime(TaskRuntime):
             finally:
                 self._processes.pop(request.task_id, None)
 
+            logging.info(
+                "Codex CLI exited for task %s with return code %s",
+                request.task_id,
+                process.returncode,
+            )
             if request.task_id in self._cancelled_task_ids:
                 yield RuntimeResult(
                     task_id=request.task_id,

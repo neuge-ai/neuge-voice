@@ -24,8 +24,11 @@ import { useMicrophone } from "./realtime/useMicrophone";
 // everything in flight immediately.
 // ---------------------------------------------------------------------------
 type TtsQueueItem = {
+  id: string;
   text: string;
+  metadata: Record<string, unknown>;
   cancelled: boolean;
+  started: boolean;
   cancel: () => void;
 };
 
@@ -37,9 +40,17 @@ class TtsPlaybackQueue {
   /** Add a text utterance to the back of the queue and start draining if idle. */
   enqueue(
     text: string,
+    metadata: Record<string, unknown>,
     play: (item: TtsQueueItem) => Promise<void>,
   ): void {
-    const item: TtsQueueItem = { text, cancelled: false, cancel: () => {} };
+    const item: TtsQueueItem = {
+      id: String(metadata.utterance_id ?? crypto.randomUUID()),
+      text,
+      metadata,
+      cancelled: false,
+      started: false,
+      cancel: () => {},
+    };
     this.queue.push(item);
     if (!this.running) {
       void this.drain(play);
@@ -47,16 +58,20 @@ class TtsPlaybackQueue {
   }
 
   /** Cancel all queued and currently-playing utterances immediately. */
-  flush(): void {
+  flush(): TtsQueueItem[] {
+    const flushed: TtsQueueItem[] = [];
     if (this.currentItem) {
       this.currentItem.cancelled = true;
+      flushed.push(this.currentItem);
       this.currentItem.cancel();
     }
     for (const item of this.queue) {
       item.cancelled = true;
+      flushed.push(item);
       item.cancel();
     }
     this.queue = [];
+    return flushed;
   }
 
   private async drain(play: (item: TtsQueueItem) => Promise<void>): Promise<void> {
@@ -140,9 +155,22 @@ export function App() {
 
   /** Cancel every queued/in-flight TTS utterance immediately. */
   const flushTtsQueue = useCallback(() => {
-    ttsQueue.current.flush();
+    const flushed = ttsQueue.current.flush();
+    for (const item of flushed) {
+      if (item.metadata.durable === true && !item.started) {
+        void transport.send({
+          event: "assistant_speech_ended",
+          metadata: {
+            ...item.metadata,
+            source: "flush",
+            utterance_id: item.id,
+            completed: false,
+            reason: "interrupted_before_playback",
+          },
+        });
+      }
+    }
     setAssistantSpeaking(false);
-    void transport.send({ event: "assistant_speech_ended", metadata: { source: "flush" } });
   }, [transport]);
 
   const stopCurrentSpeech = useCallback(() => {
@@ -155,7 +183,23 @@ export function App() {
    */
   const playTtsItem = useCallback(
     async (item: TtsQueueItem): Promise<void> => {
-      if (item.cancelled) return;
+      const speechMetadata = (completed: boolean, reason?: string): Record<string, unknown> => ({
+        ...item.metadata,
+        source: "tts_queue",
+        utterance_id: item.id,
+        completed,
+        ...(reason ? { reason } : {}),
+      });
+      const reportInterrupted = (reason: string) => {
+        if (item.metadata.durable === true) {
+          void transport.send({ event: "assistant_speech_ended", metadata: speechMetadata(false, reason) });
+        }
+      };
+
+      if (item.cancelled) {
+        reportInterrupted("interrupted_before_playback");
+        return;
+      }
 
       let result: Awaited<ReturnType<typeof synthesizeSpeech>>;
       const abortController = new AbortController();
@@ -174,7 +218,10 @@ export function App() {
           synthesizeSpeech(item.text, abortController.signal),
           cancelledBeforePlayback,
         ]);
-        if (synthesis === "cancelled") return;
+        if (synthesis === "cancelled") {
+          reportInterrupted("interrupted_before_playback");
+          return;
+        }
         result = synthesis;
       } catch (exc) {
         if (item.cancelled || abortController.signal.aborted) return;
@@ -182,10 +229,14 @@ export function App() {
         return;
       }
 
-      if (item.cancelled) return;
+      if (item.cancelled) {
+        reportInterrupted("interrupted_before_playback");
+        return;
+      }
 
       await new Promise<void>((resolve) => {
         let resolved = false;
+        let completedNaturally = false;
         const resolveOnce = () => {
           if (resolved) return;
           resolved = true;
@@ -193,9 +244,14 @@ export function App() {
         };
 
         // Before media exists, cancellation only needs to unblock the queue.
-        item.cancel = resolveOnce;
+        item.cancel = () => {
+          item.cancelled = true;
+          reportInterrupted(item.started ? "interrupted" : "interrupted_before_playback");
+          resolveOnce();
+        };
 
         if (item.cancelled) {
+          reportInterrupted("interrupted_before_playback");
           resolveOnce();
           return;
         }
@@ -212,8 +268,9 @@ export function App() {
               const source = transport.audioContext.createMediaElementSource(a);
               source.connect(transport.audioContext.destination);
               a.onplay = () => {
+                item.started = true;
                 setAssistantSpeaking(true);
-                void transport.send({ event: "assistant_speech_started", metadata: { source: "tts_queue" } });
+                void transport.send({ event: "assistant_speech_started", metadata: speechMetadata(false) });
               };
               const finish = () => {
                 if (resolved) return;
@@ -223,17 +280,21 @@ export function App() {
                   URL.revokeObjectURL(url);
                   audioObjectUrlRef.current = null;
                 }
-                void transport.send({ event: "assistant_speech_ended", metadata: { source: "tts_queue" } });
+                void transport.send({ event: "assistant_speech_ended", metadata: speechMetadata(completedNaturally, completedNaturally ? undefined : "interrupted") });
                 resolveOnce();
               };
               item.cancel = () => {
                 if (resolved) return;
+                item.cancelled = true;
                 a.pause();
                 a.removeAttribute("src");
                 a.load();
                 finish();
               };
-              a.onended = finish;
+              a.onended = () => {
+                completedNaturally = !item.cancelled;
+                finish();
+              };
               a.onerror = finish;
               a.play().catch((exc) => {
                 setError(describePlaybackException(exc));
@@ -259,22 +320,27 @@ export function App() {
           utterance.volume = 1;
           utteranceRef.current = utterance;
           utterance.onstart = () => {
+            item.started = true;
             setAssistantSpeaking(true);
-            void transport.send({ event: "assistant_speech_started", metadata: { source: "speech_synthesis" } });
+            void transport.send({ event: "assistant_speech_started", metadata: { ...speechMetadata(false), source: "speech_synthesis" } });
           };
           const finish = () => {
             if (resolved) return;
             setAssistantSpeaking(false);
             utteranceRef.current = null;
-            void transport.send({ event: "assistant_speech_ended", metadata: { source: "speech_synthesis" } });
+            void transport.send({ event: "assistant_speech_ended", metadata: { ...speechMetadata(completedNaturally, completedNaturally ? undefined : "interrupted"), source: "speech_synthesis" } });
             resolveOnce();
           };
           item.cancel = () => {
             if (resolved) return;
+            item.cancelled = true;
             window.speechSynthesis.cancel();
             finish();
           };
-          utterance.onend = finish;
+          utterance.onend = () => {
+            completedNaturally = !item.cancelled;
+            finish();
+          };
           utterance.onerror = (e) => {
             setError(`Browser speech synthesis failed: ${e.error || "unknown"}`);
             finish();
@@ -336,7 +402,16 @@ export function App() {
             event.event === "task_status") &&
           event.text
         ) {
-          ttsQueue.current.enqueue(event.text, playTtsItem);
+          ttsQueue.current.enqueue(
+            event.text,
+            {
+              ...(event.metadata ?? {}),
+              event_type: event.event,
+              task_id: event.task_id,
+              durable: event.metadata?.durable === true || event.event === "delivery_ready",
+            },
+            playTtsItem,
+          );
         }
       }
     },
