@@ -37,17 +37,12 @@ export class BrowserVoiceTransport {
   private readonly apiBase: string;
   private readonly sessionIdValue: string;
   public peerConnection: RTCPeerConnection | null = null;
-  public remoteAudioElement: HTMLAudioElement | null = null;
+  public audioContext: AudioContext;
 
   constructor(apiBase = import.meta.env.VITE_AGENT_API_BASE ?? "http://127.0.0.1:8000") {
     this.apiBase = apiBase;
     this.sessionIdValue = crypto.randomUUID();
-    
-    // Create an audio element for remote WebRTC track and append to DOM
-    this.remoteAudioElement = new Audio();
-    this.remoteAudioElement.autoplay = true;
-    this.remoteAudioElement.style.display = "none";
-    document.body.appendChild(this.remoteAudioElement);
+    this.audioContext = new AudioContext();
   }
 
   get sessionId(): string {
@@ -64,13 +59,9 @@ export class BrowserVoiceTransport {
     
     // Handle remote tracks (TTS from backend)
     this.peerConnection.ontrack = (event) => {
-      if (this.remoteAudioElement) {
-        if (event.streams && event.streams.length > 0) {
-          this.remoteAudioElement.srcObject = event.streams[0];
-        } else {
-          this.remoteAudioElement.srcObject = new MediaStream([event.track]);
-        }
-      }
+      const remoteStream = event.streams && event.streams.length > 0 ? event.streams[0] : new MediaStream([event.track]);
+      const source = this.audioContext.createMediaStreamSource(remoteStream);
+      source.connect(this.audioContext.destination);
     };
     
     const offer = await this.peerConnection.createOffer();

@@ -199,7 +199,8 @@ export function App() {
       utteranceRef.current = null;
     }
     setAssistantSpeaking(false);
-  }, []);
+    void transport.send({ event: "assistant_speech_ended", metadata: { source: "flush" } });
+  }, [transport]);
 
   const stopCurrentSpeech = useCallback(() => {
     flushTtsQueue();
@@ -239,7 +240,10 @@ export function App() {
               if (item.cancelled) { URL.revokeObjectURL(url); resolve(); return; }
               audioObjectUrlRef.current = url;
               const a = new Audio(url);
+              a.crossOrigin = "anonymous";
               audioRef.current = a;
+              const source = transport.audioContext.createMediaElementSource(a);
+              source.connect(transport.audioContext.destination);
               a.onplay = () => {
                 setAssistantSpeaking(true);
                 void transport.send({ event: "assistant_speech_started", metadata: { source: "tts_queue" } });
@@ -313,7 +317,7 @@ export function App() {
   const handleOutboundVoiceEvents = useCallback(
     (outbound: BrowserVoiceEvent[]) => {
       if (!outbound.length) return;
-      setVoiceEvents((current) => [...outbound, ...current].slice(0, 20));
+      setVoiceEvents((current) => [...[...outbound].reverse(), ...current].slice(0, 20));
 
       for (const event of outbound) {
         // ── Interrupt: flush the entire TTS queue immediately ──────────────────
@@ -415,6 +419,7 @@ export function App() {
     const stream = await mic.start();
     if (stream) {
       try {
+        await transport.audioContext.resume();
         await transport.connectWebRTC(stream);
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to connect WebRTC");
@@ -530,7 +535,7 @@ export function App() {
           {partialTranscript && <p className="note">Partial: {partialTranscript}</p>}
           {finalTranscript && <p className="note">Final: {finalTranscript}</p>}
           <ul className="voice-events">
-            {voiceEvents.slice(0, 5).map((event, index) => (
+            {voiceEvents.slice(0, 20).map((event, index) => (
               <li key={`${event.event}-${index}`}>
                 <span>{event.event}</span>
                 {event.text && <p>{event.text}</p>}

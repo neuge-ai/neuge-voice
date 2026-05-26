@@ -189,7 +189,8 @@ async def receive_voice_event(
     event: VoiceEvent,
     orchestrator: VoiceSessionOrchestrator = Depends(get_voice_orchestrator),
 ) -> dict[str, object]:
-    outbound = await orchestrator.handle_voice_event(event.session_id, event)
+    await orchestrator.handle_voice_event(event.session_id, event)
+    outbound = await orchestrator.drain_events(event.session_id)
     return {
         "status": "accepted",
         "event": event.event.value,

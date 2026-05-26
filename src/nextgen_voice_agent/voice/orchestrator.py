@@ -95,6 +95,7 @@ class VoiceSessionState:
     recent_assistant_utterances: list[tuple[datetime, str]] = field(default_factory=list)
     outbound: asyncio.Queue[VoiceEvent] = field(default_factory=asyncio.Queue)
     loop_task: asyncio.Task[None] | None = None
+    processed_segment_ids: set[str] = field(default_factory=set)
 
 
 class VoiceSessionOrchestrator:
@@ -139,7 +140,7 @@ class VoiceSessionOrchestrator:
                 pass
         await self._emit(state, VoiceEventType.SESSION_STOPPED, "Voice session stopped.")
 
-    async def handle_voice_event(self, session_id: str, event: VoiceEvent) -> list[VoiceEvent]:
+    async def handle_voice_event(self, session_id: str, event: VoiceEvent) -> None:
         state = await self.start_session(session_id, event.transport)
 
         if event.event == VoiceEventType.SPEECH_STARTED:
@@ -156,11 +157,11 @@ class VoiceSessionOrchestrator:
             state.active_utterance = UtteranceBuffer(segment_id)
             state.active_asr_mode = self.effective_asr_mode
             state.active_asr_stream = await self._start_asr_stream(state, segment_id)
-            return await self.drain_events(session_id)
+            return
 
         if event.event == VoiceEventType.USER_TURN_AUDIO:
             await self._handle_audio_frame(state, event)
-            return await self.drain_events(session_id)
+            return
 
         if event.event == VoiceEventType.SPEECH_ENDED:
             state.user_speaking = False
@@ -170,7 +171,7 @@ class VoiceSessionOrchestrator:
                 state.voice_state = VoiceTurnState.LISTENING
             elif state.voice_state == VoiceTurnState.BARGE_IN_CANDIDATE and state.assistant_speaking:
                 state.voice_state = VoiceTurnState.ASSISTANT_SPEAKING
-            return await self.drain_events(session_id)
+            return
 
         if event.event == VoiceEventType.INTERRUPTION:
             state.user_speaking = True
@@ -178,7 +179,7 @@ class VoiceSessionOrchestrator:
                 state.voice_state = VoiceTurnState.BARGE_IN_CANDIDATE
                 if self._candidate_speech_duration_ms(state) >= self.timing.barge_in_min_speech_ms:
                     await self._stop_assistant_audio(state)
-            return await self.drain_events(session_id)
+            return
 
         if event.event == VoiceEventType.ASSISTANT_SPEECH_STARTED:
             now = self.clock()
@@ -187,7 +188,7 @@ class VoiceSessionOrchestrator:
             state.last_assistant_speech_at = now
             state.assistant_speech_started_at = now
             state.post_tts_cooldown_expires_at = None
-            return await self.drain_events(session_id)
+            return
 
         if event.event == VoiceEventType.ASSISTANT_SPEECH_ENDED:
             now = self.clock()
@@ -196,20 +197,20 @@ class VoiceSessionOrchestrator:
             state.assistant_speech_ended_at = now
             state.post_tts_cooldown_expires_at = now + timedelta(milliseconds=self.timing.post_tts_cooldown_ms)
             state.voice_state = VoiceTurnState.POST_TTS_COOLDOWN
-            return await self.drain_events(session_id)
+            return
 
         if event.event in {VoiceEventType.IDLE_STATE, VoiceEventType.CLIENT_IDLE}:
             state.user_speaking = False
             state.assistant_speaking = False
             state.voice_state = VoiceTurnState.LISTENING
             state.post_tts_cooldown_expires_at = None
-            return await self.drain_events(session_id)
+            return
 
         if event.event == VoiceEventType.USER_TURN and event.text:
             await self._handle_user_turn(state, event.text)
-            return await self.drain_events(session_id)
+            return
 
-        return await self.drain_events(session_id)
+        return
 
     async def get_transcript(self, session_id: str) -> dict[str, str | None]:
         state = self.sessions.get(session_id)
@@ -221,7 +222,7 @@ class VoiceSessionOrchestrator:
             "last_partial_transcript": state.last_partial_transcript,
         }
 
-    async def handle_model_event(self, session_id: str, event: VoiceEvent) -> list[VoiceEvent]:
+    async def handle_model_event(self, session_id: str, event: VoiceEvent) -> None:
         state = await self.start_session(session_id, event.transport)
         if event.event == VoiceEventType.ASSISTANT_RESPONSE:
             now = self.clock()
@@ -229,7 +230,7 @@ class VoiceSessionOrchestrator:
             state.voice_state = VoiceTurnState.ASSISTANT_SPEAKING
             state.last_assistant_speech_at = now
             state.assistant_speech_started_at = now
-        return await self.drain_events(session_id)
+        return
 
     async def drain_events(self, session_id: str) -> list[VoiceEvent]:
         state = self.sessions[session_id]
@@ -247,6 +248,7 @@ class VoiceSessionOrchestrator:
         # utterance from racing with (or playing after) the new acknowledgement.
         if state.queued_result is not None:
             state.queued_result = None
+        state.delivered_result_generation = None
 
         if state.active_task_id and any(phrase in normalized for phrase in ["cancel", "stop", "forget that"]):
             await self.controller.cancel_task(state.active_task_id, CancelTaskRequest(reason=text))
@@ -299,6 +301,7 @@ class VoiceSessionOrchestrator:
     async def _finalize_utterance(self, state: VoiceSessionState) -> None:
         if state.active_utterance is None:
             return
+        segment_id = state.active_utterance.speech_segment_id
         frames = state.active_utterance.finalize()
         state.active_utterance = None
         if not frames or self.stt_provider is None:
@@ -324,12 +327,11 @@ class VoiceSessionOrchestrator:
         transcript = result.text.strip()
         if not transcript:
             return
+        if segment_id in state.processed_segment_ids:
+            return
+        state.processed_segment_ids.add(segment_id)
         state.last_transcript = transcript
-        candidate = self._validate_asr_candidate(
-            state,
-            transcript,
-            state.active_utterance.speech_segment_id if state.active_utterance else "unknown",
-        )
+        candidate = self._validate_asr_candidate(state, transcript, segment_id)
         await self._emit_transcript_final(state, transcript, {"provider": result.provider, **result.metadata}, candidate)
         if candidate.status != "accepted":
             return
@@ -376,6 +378,9 @@ class VoiceSessionOrchestrator:
         if event.event == SttTranscriptEventType.FINAL:
             if not transcript:
                 return
+            if event.segment_id in state.processed_segment_ids:
+                return
+            state.processed_segment_ids.add(event.segment_id)
             state.last_transcript = transcript
             candidate = self._validate_asr_candidate(state, transcript, event.segment_id)
             await self._emit_transcript_final(
