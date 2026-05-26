@@ -176,6 +176,54 @@ class ElevenLabsTtsProvider(TtsProvider):
         return b"".join(audio_generator)
 
 
+class SarvamTtsProvider(TtsProvider):
+    name = "sarvam"
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    async def synthesize(self, request: TtsRequest) -> TtsResult:
+        if self.settings.sarvam_api_key is None:
+            raise TtsProviderError(
+                "NVA_SARVAM_API_KEY or SARVAM_API_KEY is required for Sarvam TTS.",
+                provider=self.name,
+                stage="configuration",
+            )
+        if not request.text.strip():
+            raise TtsProviderError("Cannot synthesize empty text.", provider=self.name, stage="validation")
+
+        try:
+            audio_b64 = await asyncio.to_thread(self._synthesize_blocking, request.text)
+        except Exception as exc:
+            raise TtsProviderError(
+                f"Sarvam synthesis failed: {exc}",
+                provider=self.name,
+                stage="synthesis",
+            ) from exc
+
+        return TtsResult(
+            provider=self.name,
+            audio_ref=f"data:audio/wav;base64,{audio_b64}",
+            audio_mime_type="audio/wav",
+            metadata={
+                "target_language_code": self.settings.sarvam_target_language_code,
+                "model": self.settings.sarvam_model,
+                "speaker": self.settings.sarvam_speaker,
+            },
+        )
+
+    def _synthesize_blocking(self, text: str) -> str:
+        from sarvamai import SarvamAI
+        client = SarvamAI(api_subscription_key=self.settings.sarvam_api_key.get_secret_value())
+        response = client.text_to_speech.convert(
+            text=text,
+            target_language_code=self.settings.sarvam_target_language_code,
+            model=self.settings.sarvam_model,
+            speaker=self.settings.sarvam_speaker,
+        )
+        return response.audios[0]
+
+
 def _exception_message(exc: Exception) -> str:
     code = getattr(exc, "code", None)
     details = getattr(exc, "details", None)
@@ -204,5 +252,7 @@ def create_tts_provider(settings: Settings) -> TtsProvider:
         return BrowserDevTtsProvider()
     if settings.tts_provider == "elevenlabs":
         return ElevenLabsTtsProvider(settings)
-    supported = ", ".join(("nvidia_magpie", "browser_dev", "elevenlabs"))
+    if settings.tts_provider == "sarvam":
+        return SarvamTtsProvider(settings)
+    supported = ", ".join(("nvidia_magpie", "browser_dev", "elevenlabs", "sarvam"))
     raise RuntimeError(f"Unsupported TTS provider {settings.tts_provider!r}. Supported providers: {supported}.")

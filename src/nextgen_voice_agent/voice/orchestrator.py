@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from enum import StrEnum
-from typing import Callable
+from typing import Any, Callable
 
 from nextgen_voice_agent.agent.controller import AgentController, TaskConflictError
+from nextgen_voice_agent.config import get_settings
 from nextgen_voice_agent.models.runtime import RuntimeResult, RuntimeResultStatus
-from nextgen_voice_agent.models.task import CancelTaskRequest, StartTaskRequest, TaskStatus
+from nextgen_voice_agent.models.task import AmendTaskRequest, CancelTaskRequest, StartTaskRequest, TaskStatus
 from nextgen_voice_agent.models.voice import VoiceEvent, VoiceEventType, VoiceTransportKind
 from nextgen_voice_agent.voice.stt import (
     AsrMode,
@@ -22,7 +25,7 @@ from nextgen_voice_agent.voice.stt import (
     parse_audio_frame,
 )
 
-HARD_INTERRUPT_COMMANDS = {"stop", "cancel", "pause", "wait", "hold on", "never mind", "nevermind"}
+HARD_INTERRUPT_COMMANDS = {"stop", "cancel"}
 SOFT_AMENDMENT_MARKERS = {"actually", "no", "wrong", "also", "instead", "but"}
 RECENT_ASSISTANT_UTTERANCE_LIMIT = 6
 
@@ -50,6 +53,10 @@ class VoiceTimingConfig:
     fuzzy_similarity_threshold: float = 0.80
     short_transcript_max_words: int = 3
     assistant_ack_timeout_ms: int = 0
+    turn_commit_default_wait_ms: int = 700
+    turn_commit_active_task_wait_ms: int = 1300
+    turn_commit_hard_command_wait_ms: int = 0
+    turn_commit_max_pending_wait_ms: int = 2500
 
 
 @dataclass(frozen=True)
@@ -92,6 +99,9 @@ class VoiceSessionState:
     active_asr_mode: AsrMode = AsrMode.UTTERANCE_BATCH
     last_transcript: str | None = None
     last_partial_transcript: str | None = None
+    pending_transcript: str = ""
+    pending_transcript_since: datetime | None = None
+    conversation_history: list[dict[str, Any]] = field(default_factory=list)
     recent_assistant_utterances: list[tuple[datetime, str]] = field(default_factory=list)
     outbound: asyncio.Queue[VoiceEvent] = field(default_factory=asyncio.Queue)
     loop_task: asyncio.Task[None] | None = None
@@ -103,12 +113,19 @@ class VoiceSessionOrchestrator:
         self,
         controller: AgentController,
         stt_provider: SttProvider | None = None,
+        llm_provider: Any = None,
         requested_asr_mode: AsrMode = AsrMode.SPEECH_GATED_STREAMING,
         timing: VoiceTimingConfig | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.controller = controller
         self.stt_provider = stt_provider
+        
+        if llm_provider is None:
+            from nextgen_voice_agent.voice.llm_router import OrchestratorLLMProvider
+            self.llm_provider = OrchestratorLLMProvider(model=get_settings().router_model)
+        else:
+            self.llm_provider = llm_provider
         self.requested_asr_mode = requested_asr_mode
         self.effective_asr_mode = self._resolve_asr_mode()
         self.timing = timing or VoiceTimingConfig()
@@ -239,50 +256,155 @@ class VoiceSessionOrchestrator:
             events.append(state.outbound.get_nowait())
         return events
 
+    async def _maybe_commit_turn(self, state: VoiceSessionState) -> None:
+        if not state.pending_transcript or state.pending_transcript_since is None:
+            return
+
+        elapsed_ms = self._elapsed_ms(state.pending_transcript_since)
+        if state.user_speaking:
+            return
+
+        delay = self._classify_commit_delay(state)
+        if elapsed_ms >= delay:
+            text = state.pending_transcript.strip()
+            state.pending_transcript = ""
+            state.pending_transcript_since = None
+            if text:
+                await self._handle_user_turn(state, text)
+
+    def _classify_commit_delay(self, state: VoiceSessionState) -> int:
+        normalized = _normalize_turn_text(state.pending_transcript)
+        if not normalized:
+            return self.timing.turn_commit_default_wait_ms
+            
+        if _is_hard_interrupt_command(normalized):
+            return self.timing.turn_commit_hard_command_wait_ms
+            
+        if state.active_task_id:
+            return self.timing.turn_commit_active_task_wait_ms
+            
+        return self.timing.turn_commit_default_wait_ms
+
     async def _handle_user_turn(self, state: VoiceSessionState, text: str) -> None:
         state.last_user_turn_at = self.clock()
-        normalized = text.strip().lower()
 
-        # A new user turn invalidates any result that was sitting in the delivery
-        # queue but hadn't been spoken yet.  This prevents the old delivery_ready
-        # utterance from racing with (or playing after) the new acknowledgement.
+        # A new user turn invalidates any result that was sitting in the delivery queue
         if state.queued_result is not None:
+            self._append_tool_result_history(state, state.queued_result)
             state.queued_result = None
-        state.delivered_result_generation = None
-
-        if state.active_task_id and any(phrase in normalized for phrase in ["cancel", "stop", "forget that"]):
-            await self.controller.cancel_task(state.active_task_id, CancelTaskRequest(reason=text))
-            await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, "I stopped that task.", task_id=state.active_task_id)
             state.active_task_id = None
-            return
-
-        if state.active_task_id and any(phrase in normalized for phrase in ["status", "how is", "progress"]):
-            status = self.controller.get_status(state.active_task_id)
-            await self._emit(state, VoiceEventType.TASK_STATUS, status.progress or status.task.user_visible_status)
-            return
-
-        if state.active_task_id:
-            await self._emit(
-                state,
-                VoiceEventType.ASSISTANT_RESPONSE,
-                "A task is already running. Say cancel if you want me to stop it first.",
-                task_id=state.active_task_id,
-            )
-            return
-
-        try:
-            response = await self.controller.start_task(StartTaskRequest(task=text))
-        except TaskConflictError as exc:
-            await self._emit(state, VoiceEventType.ERROR, str(exc))
-            return
-
-        state.active_task_id = response.task.task_id
-        state.task_started_at = self.clock()
-        state.first_thinking_ack_sent = False
-        state.first_tool_status_sent = False
-        state.last_progress_spoken_at = None
         state.delivered_result_generation = None
-        await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, response.acknowledgement, task_id=response.task.task_id)
+        
+        logging.info(f"User Turn Committed: {text}")
+        state.conversation_history.append({"role": "user", "content": text})
+        
+        sys_state = []
+        if state.active_task_id:
+            sys_state.append(f"Active Task ID: {state.active_task_id}")
+            status = self.controller.get_status(state.active_task_id)
+            sys_state.append(f"Active Task Status: {status.task.status.value}")
+            sys_state.append(f"Active Task Progress: {status.progress or status.task.user_visible_status}")
+        else:
+            sys_state.append("Active Task ID: None")
+            
+        system_state_str = "\n".join(sys_state)
+        
+        decision = await self.llm_provider.route_turn(text, system_state_str, state.conversation_history[:-1])
+        decision_type = decision.get("type")
+        if decision_type == "assistant_response":
+            response_text = decision.get("response") or "I understand."
+            state.conversation_history.append({"role": "assistant", "content": response_text})
+            await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, response_text, task_id=state.active_task_id)
+            return
+
+        if decision_type != "tool_call":
+            await self._emit(state, VoiceEventType.ERROR, f"Unknown LLM decision type: {decision_type}")
+            return
+
+        tool_name = decision.get("tool")
+        args = decision.get("arguments", {})
+        
+        if tool_name == "start_task":
+            try:
+                task_text = args.get("task", text)
+                assistant_response = (decision.get("assistant_response") or "").strip() or "I'll start that now."
+                context = "Conversation History:\n" + "\n".join(
+                    [f"{msg['role'].capitalize()}: {msg.get('content', str(msg))}" for msg in state.conversation_history]
+                )
+                response = await self.controller.start_task(StartTaskRequest(task=task_text, context=context))
+                
+                state.active_task_id = response.task.task_id
+                state.task_started_at = self.clock()
+                state.first_thinking_ack_sent = False
+                state.first_tool_status_sent = False
+                state.last_progress_spoken_at = None
+                state.delivered_result_generation = None
+                
+                state.conversation_history.append({
+                    "role": "assistant", 
+                    "tool_calls": [{"id": f"call_{state.active_task_id}", "type": "function", "function": {"name": "start_task", "arguments": json.dumps(args)}}]
+                })
+                state.conversation_history.append({
+                    "role": "tool",
+                    "tool_call_id": f"call_{state.active_task_id}",
+                    "name": "start_task",
+                    "content": f"Started Task ID: {state.active_task_id}"
+                })
+                state.conversation_history.append({"role": "assistant", "content": assistant_response})
+                
+                await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, assistant_response, task_id=state.active_task_id)
+            except TaskConflictError as exc:
+                await self._emit(state, VoiceEventType.ERROR, str(exc))
+                
+        elif tool_name == "amend_task":
+            task_id = args.get("task_id")
+            amendment = args.get("amendment")
+            if task_id and amendment:
+                try:
+                    await self.controller.amend_task(task_id, AmendTaskRequest(amendment=amendment))
+                    msg = f"I am amending task {task_id}."
+                    state.conversation_history.append({
+                        "role": "assistant", 
+                        "tool_calls": [{"id": f"call_{task_id}_amend", "type": "function", "function": {"name": "amend_task", "arguments": json.dumps(args)}}]
+                    })
+                    state.conversation_history.append({
+                        "role": "tool",
+                        "tool_call_id": f"call_{task_id}_amend",
+                        "name": "amend_task",
+                        "content": f"Amended Task ID: {task_id}"
+                    })
+                    state.conversation_history.append({"role": "assistant", "content": msg})
+                    await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, msg, task_id=task_id)
+                except Exception as exc:
+                    await self._emit(state, VoiceEventType.ERROR, str(exc))
+            else:
+                await self._emit(state, VoiceEventType.ERROR, "Missing task_id or amendment for amend_task")
+                
+        elif tool_name == "cancel_task":
+            task_id = args.get("task_id")
+            if task_id:
+                try:
+                    await self.controller.cancel_task(task_id, CancelTaskRequest(reason="User voice cancellation"))
+                    msg = f"I stopped task {task_id}."
+                    state.conversation_history.append({
+                        "role": "assistant", 
+                        "tool_calls": [{"id": f"call_{task_id}_cancel", "type": "function", "function": {"name": "cancel_task", "arguments": json.dumps(args)}}]
+                    })
+                    state.conversation_history.append({
+                        "role": "tool",
+                        "tool_call_id": f"call_{task_id}_cancel",
+                        "name": "cancel_task",
+                        "content": f"Cancelled Task ID: {task_id}"
+                    })
+                    state.conversation_history.append({"role": "assistant", "content": msg})
+                    await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, msg, task_id=task_id)
+                    if state.active_task_id == task_id:
+                        state.active_task_id = None
+                except Exception as exc:
+                    await self._emit(state, VoiceEventType.ERROR, str(exc))
+                    
+        else:
+            await self._emit(state, VoiceEventType.ERROR, f"Unknown LLM decision: {tool_name}")
 
     async def _handle_audio_frame(self, state: VoiceSessionState, event: VoiceEvent) -> None:
         if state.active_utterance is None:
@@ -312,17 +434,12 @@ class VoiceSessionOrchestrator:
             try:
                 await self._handle_transcript_event(state, await stream.commit())
                 return
-            except Exception:
-                await self._emit(
-                    state,
-                    VoiceEventType.STT_ERROR,
-                    "Streaming transcription failed. Falling back to buffered transcription.",
-                    metadata={"fallback": "utterance_batch"},
-                )
+            except Exception as e:
+                logging.debug(f"Streaming transcription failed (likely background noise): {e}")
         try:
             result = await self.stt_provider.transcribe_utterance(frames)
-        except Exception:
-            await self._emit(state, VoiceEventType.STT_ERROR, "I missed that. Could you say it again?")
+        except Exception as e:
+            logging.debug(f"Utterance transcription failed (likely background noise): {e}")
             return
         transcript = result.text.strip()
         if not transcript:
@@ -337,7 +454,11 @@ class VoiceSessionOrchestrator:
             return
         if candidate.during_assistant_speech or candidate.during_cooldown:
             await self._stop_assistant_audio(state)
-        await self._handle_user_turn(state, transcript)
+        
+        state.pending_transcript = f"{state.pending_transcript} {transcript}".strip()
+        state.pending_transcript_since = self.clock()
+        if self._classify_commit_delay(state) == 0:
+            await self._maybe_commit_turn(state)
 
     async def _start_asr_stream(self, state: VoiceSessionState, segment_id: str) -> SttStream | None:
         if self.stt_provider is None or self.effective_asr_mode != AsrMode.SPEECH_GATED_STREAMING:
@@ -393,7 +514,11 @@ class VoiceSessionOrchestrator:
                 return
             if candidate.during_assistant_speech or candidate.during_cooldown:
                 await self._stop_assistant_audio(state)
-            await self._handle_user_turn(state, transcript)
+            
+            state.pending_transcript = f"{state.pending_transcript} {transcript}".strip()
+            state.pending_transcript_since = self.clock()
+            if self._classify_commit_delay(state) == 0:
+                await self._maybe_commit_turn(state)
 
     async def _maybe_cancel_from_partial(self, state: VoiceSessionState, transcript: str, confidence: float | None) -> None:
         if confidence is not None and confidence < 0.75:
@@ -418,6 +543,7 @@ class VoiceSessionOrchestrator:
             while not state.stopped:
                 await asyncio.sleep(interval)
                 self._advance_turn_state(state)
+                await self._maybe_commit_turn(state)
                 await self._poll_task_result(state)
                 await self._maybe_emit_progress(state)
                 await self._maybe_deliver_result(state)
@@ -474,12 +600,48 @@ class VoiceSessionOrchestrator:
         if state.delivered_result_generation == result.generation:
             return
 
-        intro = "I have the result now. " if result.status == RuntimeResultStatus.COMPLETED else ""
-        answer = result.spoken_answer or result.error or "The task finished without a spoken answer."
-        await self._emit(state, VoiceEventType.DELIVERY_READY, f"{intro}{answer}", task_id=result.task_id)
+        answer = await self._compose_delivery_answer(state, result)
+        self._append_tool_result_history(state, result)
+        state.conversation_history.append({"role": "assistant", "content": answer})
+        await self._emit(state, VoiceEventType.DELIVERY_READY, answer, task_id=result.task_id)
         state.delivered_result_generation = result.generation
         state.queued_result = None
         state.active_task_id = None
+
+    async def _compose_delivery_answer(self, state: VoiceSessionState, result: RuntimeResult) -> str:
+        fallback = result.spoken_answer or result.error or "The task finished without a spoken answer."
+        if result.status == RuntimeResultStatus.COMPLETED:
+            fallback = f"I have the result now. {fallback}"
+
+        composer = getattr(self.llm_provider, "compose_tool_result", None)
+        if not callable(composer):
+            return fallback
+
+        sys_state = f"Completed Task ID: {result.task_id}\nCompleted Task Status: {result.status.value}"
+        task = self.controller.tasks.get(result.task_id)
+        user_text = task.original_request if task else result.task_id
+        try:
+            composed = await composer(
+                user_text,
+                sys_state,
+                state.conversation_history,
+                result,
+            )
+        except Exception as exc:
+            logging.error(f"Error composing delivery answer: {exc}")
+            return fallback
+        return (composed or "").strip() or fallback
+
+    def _append_tool_result_history(self, state: VoiceSessionState, result: RuntimeResult) -> None:
+        tool_call_id = f"result_{result.task_id}"
+        if any(msg.get("role") == "tool" and msg.get("tool_call_id") == tool_call_id for msg in state.conversation_history):
+            return
+        state.conversation_history.append({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "name": "start_task",
+            "content": json.dumps(result.model_dump(mode="json")),
+        })
 
     async def _emit(
         self,

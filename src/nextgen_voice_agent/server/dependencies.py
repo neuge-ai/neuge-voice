@@ -12,7 +12,7 @@ from nextgen_voice_agent.voice.orchestrator import VoiceSessionOrchestrator
 def create_controller(settings: Settings | None = None) -> AgentController:
     settings = settings or get_settings()
     if settings.runtime == "codex_cli":
-        runtime = CodexCliRuntime(command=settings.codex_command)
+        runtime = CodexCliRuntime(command=settings.codex_command, model=settings.codex_model)
     else:
         runtime = FakeRuntime()
     return AgentController(runtime=runtime)

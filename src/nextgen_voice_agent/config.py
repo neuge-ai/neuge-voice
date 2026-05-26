@@ -10,9 +10,11 @@ class Settings(BaseSettings):
     environment: str = "development"
     runtime: str = Field(default="fake", description="Runtime adapter: fake or codex_cli.")
     codex_command: str = "codex"
+    codex_model: str = "gpt-5.4-mini"
     openai_api_key: SecretStr | None = None
     openai_realtime_model: str = "gpt-realtime-mini"
     openai_realtime_voice: str = "alloy"
+    router_model: str = "groq/qwen/qwen3-32b"
     stt_provider: str = Field(default="fake", description="STT provider: fake or nvidia_parakeet.")
     asr_mode: str = Field(default="speech_gated_streaming", description="ASR mode: speech_gated_streaming or utterance_batch.")
     fake_stt_transcript: str = "Check this week's weather and average noon and evening temperatures."
@@ -40,6 +42,11 @@ class Settings(BaseSettings):
     elevenlabs_voice_id: str = "ErXwobaYiN019PkySvjV"
     elevenlabs_model_id: str = "eleven_multilingual_v2"
     elevenlabs_output_format: str = "mp3_44100_128"
+
+    sarvam_api_key: SecretStr | None = Field(default=None, validation_alias=AliasChoices("NVA_SARVAM_API_KEY", "SARVAM_API_KEY"))
+    sarvam_target_language_code: str = "en-IN"
+    sarvam_model: str = "bulbul:v3"
+    sarvam_speaker: str = "priya"
 
     model_config = SettingsConfigDict(env_prefix="NVA_", env_file=".env", extra="ignore")
 

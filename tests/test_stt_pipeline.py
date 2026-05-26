@@ -22,7 +22,7 @@ async def test_pcm_audio_turn_routes_fake_transcript_into_task_flow() -> None:
     orchestrator = VoiceSessionOrchestrator(
         controller=controller,
         stt_provider=FakeSttProvider("Analyze the demo weather."),
-        timing=VoiceTimingConfig(control_loop_ms=10, first_thinking_ack_ms=5000, first_tool_status_ms=5000),
+        timing=VoiceTimingConfig(control_loop_ms=10, first_thinking_ack_ms=5000, first_tool_status_ms=5000, turn_commit_default_wait_ms=0, turn_commit_active_task_wait_ms=0, turn_commit_hard_command_wait_ms=0),
     )
     session_id = "browser-session"
     segment_id = "segment-1"
@@ -52,7 +52,7 @@ async def test_pcm_audio_turn_routes_fake_transcript_into_task_flow() -> None:
             },
         ),
     )
-    outbound = await orchestrator.handle_voice_event(
+    await orchestrator.handle_voice_event(
         session_id,
         VoiceEvent(
             event=VoiceEventType.SPEECH_ENDED,
@@ -61,7 +61,12 @@ async def test_pcm_audio_turn_routes_fake_transcript_into_task_flow() -> None:
             metadata={"speech_segment_id": segment_id},
         ),
     )
-
+    import asyncio
+    for _ in range(50):
+        if orchestrator.sessions[session_id].active_task_id is not None:
+            break
+        await asyncio.sleep(0.01)
+    outbound = await orchestrator.drain_events(session_id)
     assert any(event.event == VoiceEventType.TRANSCRIPT_FINAL and event.text == "Analyze the demo weather." for event in outbound)
     task_id = orchestrator.sessions[session_id].active_task_id
     assert task_id is not None
@@ -77,6 +82,7 @@ async def test_streaming_asr_emits_partial_before_final_without_starting_task() 
         controller=controller,
         stt_provider=FakeSttProvider("Look up the weather this week."),
         requested_asr_mode=AsrMode.SPEECH_GATED_STREAMING,
+        timing=VoiceTimingConfig(turn_commit_default_wait_ms=0, turn_commit_active_task_wait_ms=0, turn_commit_hard_command_wait_ms=0)
     )
     session_id = "browser-session"
     segment_id = "segment-1"
@@ -90,7 +96,7 @@ async def test_streaming_asr_emits_partial_before_final_without_starting_task() 
             metadata={"speech_segment_id": segment_id},
         ),
     )
-    partial_events = await orchestrator.handle_voice_event(
+    await orchestrator.handle_voice_event(
         session_id,
         VoiceEvent(
             event=VoiceEventType.USER_TURN_AUDIO,
@@ -100,11 +106,12 @@ async def test_streaming_asr_emits_partial_before_final_without_starting_task() 
             metadata={"speech_segment_id": segment_id, "sequence": 1},
         ),
     )
+    partial_events = await orchestrator.drain_events(session_id)
 
     assert any(event.event == VoiceEventType.TRANSCRIPT_PARTIAL for event in partial_events)
     assert orchestrator.sessions[session_id].active_task_id is None
 
-    final_events = await orchestrator.handle_voice_event(
+    await orchestrator.handle_voice_event(
         session_id,
         VoiceEvent(
             event=VoiceEventType.SPEECH_ENDED,
@@ -113,6 +120,7 @@ async def test_streaming_asr_emits_partial_before_final_without_starting_task() 
             metadata={"speech_segment_id": segment_id},
         ),
     )
+    final_events = await orchestrator.drain_events(session_id)
 
     assert any(event.event == VoiceEventType.TRANSCRIPT_FINAL for event in final_events)
     assert orchestrator.sessions[session_id].active_task_id is not None
@@ -139,7 +147,7 @@ async def test_batch_asr_mode_preserves_buffer_then_transcribe_behavior() -> Non
             metadata={"speech_segment_id": segment_id},
         ),
     )
-    audio_events = await orchestrator.handle_voice_event(
+    await orchestrator.handle_voice_event(
         session_id,
         VoiceEvent(
             event=VoiceEventType.USER_TURN_AUDIO,
@@ -149,9 +157,10 @@ async def test_batch_asr_mode_preserves_buffer_then_transcribe_behavior() -> Non
             metadata={"speech_segment_id": segment_id, "sequence": 1},
         ),
     )
+    audio_events = await orchestrator.drain_events(session_id)
 
     assert all(event.event != VoiceEventType.TRANSCRIPT_PARTIAL for event in audio_events)
-    final_events = await orchestrator.handle_voice_event(
+    await orchestrator.handle_voice_event(
         session_id,
         VoiceEvent(
             event=VoiceEventType.SPEECH_ENDED,
@@ -160,6 +169,7 @@ async def test_batch_asr_mode_preserves_buffer_then_transcribe_behavior() -> Non
             metadata={"speech_segment_id": segment_id},
         ),
     )
+    final_events = await orchestrator.drain_events(session_id)
 
     assert any(event.event == VoiceEventType.TRANSCRIPT_FINAL for event in final_events)
     assert orchestrator.effective_asr_mode == AsrMode.UTTERANCE_BATCH
@@ -189,7 +199,7 @@ async def test_partial_cancellation_stops_active_task_before_final() -> None:
             metadata={"speech_segment_id": segment_id},
         ),
     )
-    events = await orchestrator.handle_voice_event(
+    await orchestrator.handle_voice_event(
         session_id,
         VoiceEvent(
             event=VoiceEventType.USER_TURN_AUDIO,
@@ -199,6 +209,7 @@ async def test_partial_cancellation_stops_active_task_before_final() -> None:
             metadata={"speech_segment_id": segment_id, "sequence": 1},
         ),
     )
+    events = await orchestrator.drain_events(session_id)
 
     assert any(event.event == VoiceEventType.TRANSCRIPT_PARTIAL for event in events)
     assert controller.get_status(start.task.task_id).task.status == TaskStatus.CANCELLED

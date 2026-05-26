@@ -11,10 +11,11 @@ def build_codex_task_prompt(task: Task, request: StartTaskRequest) -> str:
     return f"""You are the task engine behind a realtime voice assistant.
 
 Solve the user's task using available tools, web search, MCP servers, data access, and code execution when useful.
+You are a tool/fact engine, not the final conversational assistant. An upstream supervisor will phrase the final response.
 
 Important:
-- Return a concise spoken answer suitable for voice.
-- Include key calculations or reasoning.
+- Return concise facts and conclusions in `spoken_answer`; do not over-polish the wording.
+- Include key calculations or reasoning in `technical_summary`.
 - Include sources/tools used when applicable.
 - Do not include long logs unless asked.
 - Do not perform irreversible actions without explicit user approval.
@@ -34,7 +35,7 @@ Return structured JSON:
   "task_id": "{task.task_id}",
   "generation": {task.generation},
   "status": "completed | needs_clarification | needs_approval | failed",
-  "spoken_answer": "...",
+  "spoken_answer": "Concise factual answer for the supervisor to phrase.",
   "technical_summary": "...",
   "sources_or_tools_used": [],
   "actions_requiring_approval": [],

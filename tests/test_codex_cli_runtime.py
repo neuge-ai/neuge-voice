@@ -97,12 +97,35 @@ async def test_codex_cli_uses_schema_and_result_file() -> None:
 
     messages = await collect_results(runtime)
 
-    assert process.args[:2] == ("codex", "exec")
+    assert process.args[:4] == ("codex", "-a", "never", "exec")
     assert "--skip-git-repo-check" in process.args
     assert "--output-schema" in process.args
     assert "-o" in process.args
     assert process.args[-1] == "Return structured JSON."
     assert messages[-1] == result
+
+
+@pytest.mark.asyncio
+async def test_codex_cli_passes_configured_model() -> None:
+    result = RuntimeResult(
+        task_id="task_codex",
+        generation=1,
+        status=RuntimeResultStatus.COMPLETED,
+        spoken_answer="Done.",
+    )
+    process = FakeProcess(result_payload=result.model_dump(mode="json"))
+
+    async def process_factory(*args: Any, **kwargs: Any) -> FakeProcess:
+        process.args = args
+        return process
+
+    runtime = CodexCliRuntime(model="gpt-5.4-mini", process_factory=process_factory)
+
+    await collect_results(runtime)
+
+    assert "-m" in process.args
+    assert process.args[process.args.index("-m") + 1] == "gpt-5.4-mini"
+    assert process.args[-1] == "Return structured JSON."
 
 
 @pytest.mark.asyncio
