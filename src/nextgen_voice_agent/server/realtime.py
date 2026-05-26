@@ -8,6 +8,7 @@ from typing import Any
 
 from nextgen_voice_agent.config import Settings
 from nextgen_voice_agent.models.realtime import RealtimeSessionConfig, RealtimeTool
+from nextgen_voice_agent.voice.llm_router import SANITY_CHECK_INSTRUCTIONS
 
 
 OPENAI_REALTIME_CLIENT_SECRETS_URL = "https://api.openai.com/v1/realtime/client_secrets"
@@ -21,8 +22,14 @@ def build_realtime_session_config(settings: Settings) -> RealtimeSessionConfig:
             "You are the realtime voice shell for a local Codex-powered task agent. "
             "Answer simple conversational questions directly. For nontrivial research, "
             "coding, analysis, private-data, or multi-step tasks, call the task tools. "
+            "For timers, activity tracking, elapsed-time checks, and cancellation/status checks, "
+            "call native deterministic tools instead of Codex. "
+            "Only one Codex task may run at a time. If a Codex task is already active, "
+            "do not start another complex task; ask whether to cancel/switch or keep the current task running. "
+            "Native tools and simple conversation remain available while Codex runs. "
             "Keep speech concise, stay interruptible, and never claim a Codex task is "
-            "finished until read_codex_result returns a completed result."
+            "finished until read_codex_result returns a completed result.\n\n"
+            f"{SANITY_CHECK_INSTRUCTIONS}"
         ),
         tools=[
             RealtimeTool(
@@ -96,6 +103,120 @@ def build_realtime_session_config(settings: Settings) -> RealtimeSessionConfig:
                         "approved": {"type": "boolean"},
                     },
                     "required": ["task_id", "action_id", "approved"],
+                },
+            ),
+            RealtimeTool(
+                name="start_timer",
+                description="Start a deterministic timer.",
+                parameters={
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "duration_ms": {"type": "integer"},
+                        "label": {"type": "string"},
+                        "reason": {"type": ["string", "null"]},
+                    },
+                    "required": ["duration_ms", "label", "reason"],
+                },
+            ),
+            RealtimeTool(
+                name="get_timer_status",
+                description="Read elapsed and remaining time for a timer.",
+                parameters={
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {"timer_id": {"type": ["string", "null"]}},
+                    "required": ["timer_id"],
+                },
+            ),
+            RealtimeTool(
+                name="list_active_timers",
+                description="List active timers.",
+                parameters={"type": "object", "additionalProperties": False, "properties": {}, "required": []},
+            ),
+            RealtimeTool(
+                name="cancel_timer",
+                description="Cancel a timer.",
+                parameters={
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {"timer_id": {"type": ["string", "null"]}},
+                    "required": ["timer_id"],
+                },
+            ),
+            RealtimeTool(
+                name="start_activity",
+                description="Start tracking an activity with optional duration or distance target.",
+                parameters={
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "activity_type": {"type": "string"},
+                        "label": {"type": "string"},
+                        "target_duration_ms": {"type": ["integer", "null"]},
+                        "target_distance_meters": {"type": ["integer", "null"]},
+                    },
+                    "required": ["activity_type", "label", "target_duration_ms", "target_distance_meters"],
+                },
+            ),
+            RealtimeTool(
+                name="get_activity_status",
+                description="Read factual status for an activity.",
+                parameters={
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {"activity_id": {"type": ["string", "null"]}},
+                    "required": ["activity_id"],
+                },
+            ),
+            RealtimeTool(
+                name="list_active_activities",
+                description="List active activities.",
+                parameters={"type": "object", "additionalProperties": False, "properties": {}, "required": []},
+            ),
+            RealtimeTool(
+                name="end_activity",
+                description="End an active activity after reasoning over state and the latest user claim.",
+                parameters={
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {"activity_id": {"type": ["string", "null"]}},
+                    "required": ["activity_id"],
+                },
+            ),
+            RealtimeTool(
+                name="cancel_activity",
+                description="Cancel activity tracking.",
+                parameters={
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {"activity_id": {"type": ["string", "null"]}},
+                    "required": ["activity_id"],
+                },
+            ),
+            RealtimeTool(
+                name="list_active_background_tasks",
+                description="List active background Codex tasks.",
+                parameters={"type": "object", "additionalProperties": False, "properties": {}, "required": []},
+            ),
+            RealtimeTool(
+                name="get_background_task_status",
+                description="Read status for a background Codex task.",
+                parameters={
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {"task_id": {"type": ["string", "null"]}},
+                    "required": ["task_id"],
+                },
+            ),
+            RealtimeTool(
+                name="cancel_background_task",
+                description="Cancel a background Codex task.",
+                parameters={
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {"task_id": {"type": ["string", "null"]}, "reason": {"type": ["string", "null"]}},
+                    "required": ["task_id", "reason"],
                 },
             ),
         ],

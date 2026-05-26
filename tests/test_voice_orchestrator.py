@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime
+from datetime import timedelta
 
 import pytest
 
@@ -138,6 +140,588 @@ async def test_orchestrator_speaks_router_acknowledgement_for_voice_task() -> No
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_uses_controller_acknowledgement_when_router_tool_ack_is_generic() -> None:
+    class GenericAckRouter:
+        async def route_turn(self, user_text, system_state, conversation_history):
+            return {
+                "type": "tool_call",
+                "tool": "start_task",
+                "arguments": {"task": user_text},
+                "assistant_response": "I'll start that now.",
+            }
+
+    controller = AgentController(runtime=FakeRuntime(delay_seconds=1.0))
+    orchestrator = VoiceSessionOrchestrator(
+        controller=controller,
+        llm_provider=GenericAckRouter(),
+        timing=VoiceTimingConfig(control_loop_ms=10),
+    )
+    session_id = "browser-session"
+
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(
+            event=VoiceEventType.USER_TURN,
+            transport=VoiceTransportKind.BROWSER,
+            session_id=session_id,
+            text="Check weather in Calcutta.",
+        ),
+    )
+    events = await orchestrator.drain_events(session_id)
+
+    assistant_events = [event for event in events if event.event == VoiceEventType.ASSISTANT_RESPONSE]
+    assert assistant_events[-1].text is not None
+    assert assistant_events[-1].text == "I'll look into that in the background."
+    assert "I'll start that now." not in assistant_events[-1].text
+    await orchestrator.stop_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_records_timestamped_history_and_structured_state() -> None:
+    now = datetime(2026, 5, 26, 14, 32, 18)
+
+    class DirectRouter:
+        async def route_turn(self, user_text, system_state, conversation_history):
+            assert "Structured Session State" in system_state
+            assert "2026-05-26T14:32:18" in system_state
+            return {"type": "assistant_response", "response": "Okay."}
+
+    controller = AgentController(runtime=FakeRuntime(delay_seconds=0.01))
+    orchestrator = VoiceSessionOrchestrator(
+        controller=controller,
+        llm_provider=DirectRouter(),
+        clock=lambda: now,
+        timing=VoiceTimingConfig(control_loop_ms=10),
+    )
+    session_id = "browser-session"
+
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(event=VoiceEventType.USER_TURN, transport=VoiceTransportKind.BROWSER, session_id=session_id, text="hello"),
+    )
+
+    history = orchestrator.sessions[session_id].conversation_history
+    assert history[0]["role"] == "user"
+    assert history[0]["timestamp"].startswith("2026-05-26T14:32:18")
+    assert history[1]["role"] == "assistant"
+    assert history[1]["timestamp"].startswith("2026-05-26T14:32:18")
+    await orchestrator.stop_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_native_activity_payload_is_factual_only() -> None:
+    now = datetime(2026, 5, 26, 14, 0, 0)
+
+    def clock() -> datetime:
+        return now
+
+    class ActivityRouter:
+        async def route_turn(self, user_text, system_state, conversation_history):
+            return {
+                "type": "tool_call",
+                "tool": "start_activity",
+                "arguments": {"activity_type": "run", "label": "5 km run", "target_distance_meters": 5000},
+                "assistant_response": "I started tracking your 5 km run.",
+            }
+
+    controller = AgentController(runtime=FakeRuntime(delay_seconds=0.01))
+    orchestrator = VoiceSessionOrchestrator(
+        controller=controller,
+        llm_provider=ActivityRouter(),
+        clock=clock,
+        timing=VoiceTimingConfig(control_loop_ms=10),
+    )
+    session_id = "browser-session"
+
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(event=VoiceEventType.USER_TURN, transport=VoiceTransportKind.BROWSER, session_id=session_id, text="I'm going for a 5 km run."),
+    )
+    now = now + timedelta(seconds=15)
+    state = orchestrator.sessions[session_id]
+    payload = orchestrator._session_state_payload(state)
+
+    activity = payload["active_activities"][0]
+    assert activity["elapsed_ms"] == 15000
+    assert activity["target_distance_meters"] == 5000
+    assert "computed_plausibility" not in activity
+    await orchestrator.stop_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_uses_native_tool_message_when_router_tool_ack_is_generic() -> None:
+    class GenericActivityAckRouter:
+        async def route_turn(self, user_text, system_state, conversation_history):
+            return {
+                "type": "tool_call",
+                "tool": "start_activity",
+                "arguments": {"activity_type": "run", "label": "run"},
+                "assistant_response": "I'll start that now.",
+            }
+
+        async def compose_native_tool_result(
+            self,
+            user_text,
+            system_state,
+            conversation_history,
+            tool_name,
+            tool_result,
+            fallback,
+        ):
+            assert tool_name == "start_activity"
+            assert "activity" in tool_result
+            return "I started tracking your run."
+
+    controller = AgentController(runtime=FakeRuntime(delay_seconds=0.01))
+    orchestrator = VoiceSessionOrchestrator(
+        controller=controller,
+        llm_provider=GenericActivityAckRouter(),
+        timing=VoiceTimingConfig(control_loop_ms=10),
+    )
+    session_id = "browser-session"
+
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(event=VoiceEventType.USER_TURN, transport=VoiceTransportKind.BROWSER, session_id=session_id, text="I'm going for a run."),
+    )
+    events = await orchestrator.drain_events(session_id)
+
+    assistant_events = [event for event in events if event.event == VoiceEventType.ASSISTANT_RESPONSE]
+    assert assistant_events[-1].text == "I started tracking your run."
+    await orchestrator.stop_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_rejects_end_activity_when_target_duration_has_not_elapsed() -> None:
+    now = datetime(2026, 5, 26, 14, 0, 0)
+
+    def clock() -> datetime:
+        return now
+
+    class EarlyFinishRouter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def route_turn(self, user_text, system_state, conversation_history):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "type": "tool_call",
+                    "tool": "start_activity",
+                    "arguments": {"activity_type": "run", "label": "5 minute run", "target_duration_ms": 300000},
+                    "assistant_response": "I'll start that now.",
+                }
+            return {
+                "type": "tool_call",
+                "tool": "end_activity",
+                "arguments": {},
+                "assistant_response": "Your 5-minute run is complete. Great job!",
+            }
+
+        async def compose_native_tool_result(
+            self,
+            user_text,
+            system_state,
+            conversation_history,
+            tool_name,
+            tool_result,
+            fallback,
+        ):
+            assert tool_name == "end_activity"
+            assert tool_result["ok"] is False
+            return "That was only about ten seconds, so the five-minute run is still active."
+
+    controller = AgentController(runtime=FakeRuntime(delay_seconds=0.01))
+    orchestrator = VoiceSessionOrchestrator(
+        controller=controller,
+        llm_provider=EarlyFinishRouter(),
+        clock=clock,
+        timing=VoiceTimingConfig(control_loop_ms=10),
+    )
+    session_id = "browser-session"
+
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(event=VoiceEventType.USER_TURN, transport=VoiceTransportKind.BROWSER, session_id=session_id, text="I'm going for a five minute run."),
+    )
+    now = now + timedelta(seconds=10)
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(event=VoiceEventType.USER_TURN, transport=VoiceTransportKind.BROWSER, session_id=session_id, text="I finished."),
+    )
+
+    events = await orchestrator.drain_events(session_id)
+    assistant_events = [event for event in events if event.event == VoiceEventType.ASSISTANT_RESPONSE]
+    assert assistant_events[-1].text == "That was only about ten seconds, so the five-minute run is still active."
+    state = orchestrator.sessions[session_id]
+    activity = next(iter(state.active_activities.values()))
+    assert activity.status == "active"
+    tool_messages = [message for message in state.conversation_history if message.get("role") == "tool" and message.get("name") == "end_activity"]
+    rejection = json.loads(tool_messages[-1]["content"])
+    assert rejection["ok"] is False
+    assert rejection["error_code"] == "activity_completion_too_early"
+    await orchestrator.stop_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_rejects_end_activity_when_stored_distance_is_physically_impossible() -> None:
+    now = datetime(2026, 5, 26, 14, 0, 0)
+
+    def clock() -> datetime:
+        return now
+
+    class ImpossibleDistanceRouter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def route_turn(self, user_text, system_state, conversation_history):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "type": "tool_call",
+                    "tool": "start_activity",
+                    "arguments": {"activity_type": "run", "label": "5 km run", "target_distance_meters": 5000},
+                    "assistant_response": "I'll start that now.",
+                }
+            return {
+                "type": "tool_call",
+                "tool": "end_activity",
+                "arguments": {},
+                "assistant_response": "Your 5 km run is complete. Great job!",
+            }
+
+        async def compose_native_tool_result(
+            self,
+            user_text,
+            system_state,
+            conversation_history,
+            tool_name,
+            tool_result,
+            fallback,
+        ):
+            assert tool_name == "end_activity"
+            assert tool_result["ok"] is False
+            return "That pace would be impossible, so I'm keeping the run active."
+
+    controller = AgentController(runtime=FakeRuntime(delay_seconds=0.01))
+    orchestrator = VoiceSessionOrchestrator(
+        controller=controller,
+        llm_provider=ImpossibleDistanceRouter(),
+        clock=clock,
+        timing=VoiceTimingConfig(control_loop_ms=10),
+    )
+    session_id = "browser-session"
+
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(event=VoiceEventType.USER_TURN, transport=VoiceTransportKind.BROWSER, session_id=session_id, text="I'm going for a 5 km run."),
+    )
+    now = now + timedelta(seconds=15)
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(event=VoiceEventType.USER_TURN, transport=VoiceTransportKind.BROWSER, session_id=session_id, text="I finished."),
+    )
+
+    events = await orchestrator.drain_events(session_id)
+    assistant_events = [event for event in events if event.event == VoiceEventType.ASSISTANT_RESPONSE]
+    assert assistant_events[-1].text == "That pace would be impossible, so I'm keeping the run active."
+    state = orchestrator.sessions[session_id]
+    activity = next(iter(state.active_activities.values()))
+    assert activity.status == "active"
+    tool_messages = [message for message in state.conversation_history if message.get("role") == "tool" and message.get("name") == "end_activity"]
+    rejection = json.loads(tool_messages[-1]["content"])
+    assert rejection["ok"] is False
+    assert rejection["error_code"] == "activity_completion_physically_implausible"
+    assert rejection["implied_speed_mps"] == 333.3
+    await orchestrator.stop_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_progress_policy_can_stay_silent() -> None:
+    class SilentProgressRouter:
+        async def route_turn(self, user_text, system_state, conversation_history):
+            return {
+                "type": "tool_call",
+                "tool": "start_task",
+                "arguments": {"task": user_text},
+                "assistant_response": "I'll check that.",
+            }
+
+        async def decide_progress(self, progress_state, conversation_history):
+            return {"action": "stay_silent", "message": None, "next_check_ms": 10000}
+
+    controller = AgentController(runtime=FakeRuntime(delay_seconds=1.0))
+    orchestrator = VoiceSessionOrchestrator(
+        controller=controller,
+        llm_provider=SilentProgressRouter(),
+        timing=VoiceTimingConfig(control_loop_ms=10, first_progress_check_ms=20),
+    )
+    session_id = "browser-session"
+
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(event=VoiceEventType.USER_TURN, transport=VoiceTransportKind.BROWSER, session_id=session_id, text="Check demo weather."),
+    )
+    await asyncio.sleep(0.08)
+    events = await orchestrator.drain_events(session_id)
+
+    assert all(event.event != VoiceEventType.TASK_STATUS for event in events)
+    assert orchestrator.sessions[session_id].progress_check_count >= 1
+    await orchestrator.stop_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_blocks_second_codex_task_with_graceful_response() -> None:
+    class AlwaysStartTaskRouter:
+        async def route_turn(self, user_text, system_state, conversation_history):
+            return {
+                "type": "tool_call",
+                "tool": "start_task",
+                "arguments": {"task": user_text},
+                "assistant_response": "I'll start that now.",
+            }
+
+    controller = AgentController(runtime=FakeRuntime(delay_seconds=1.0))
+    orchestrator = VoiceSessionOrchestrator(
+        controller=controller,
+        llm_provider=AlwaysStartTaskRouter(),
+        timing=VoiceTimingConfig(control_loop_ms=10),
+    )
+    session_id = "browser-session"
+
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(event=VoiceEventType.USER_TURN, transport=VoiceTransportKind.BROWSER, session_id=session_id, text="Analyze the repo."),
+    )
+    first_task_id = orchestrator.sessions[session_id].active_task_id
+    assert first_task_id is not None
+
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(event=VoiceEventType.USER_TURN, transport=VoiceTransportKind.BROWSER, session_id=session_id, text="Now research tomorrow's weather."),
+    )
+    events = await orchestrator.drain_events(session_id)
+
+    assistant_events = [event for event in events if event.event == VoiceEventType.ASSISTANT_RESPONSE]
+    assert assistant_events[-1].task_id == first_task_id
+    assert "already have a background task running" in assistant_events[-1].text
+    assert len(controller.tasks) == 1
+    assert orchestrator.sessions[session_id].active_task_id == first_task_id
+    tool_messages = [
+        message for message in orchestrator.sessions[session_id].conversation_history
+        if message.get("role") == "tool" and message.get("name") == "start_task"
+    ]
+    conflict = json.loads(tool_messages[-1]["content"])
+    assert conflict["ok"] is False
+    assert conflict["error_code"] == "codex_task_conflict"
+    assert conflict["recoverable"] is True
+    assert conflict["active_task"]["task_id"] == first_task_id
+    await orchestrator.stop_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_allows_native_timer_while_codex_task_runs() -> None:
+    class StartThenTimerRouter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def route_turn(self, user_text, system_state, conversation_history):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "type": "tool_call",
+                    "tool": "start_task",
+                    "arguments": {"task": user_text},
+                    "assistant_response": "I'll start that.",
+                }
+            assert '"can_start_new_codex_task": false' in system_state
+            return {
+                "type": "tool_call",
+                "tool": "start_timer",
+                "arguments": {"duration_ms": 300000, "label": "five-minute timer"},
+                "assistant_response": "I started the timer.",
+            }
+
+    controller = AgentController(runtime=FakeRuntime(delay_seconds=1.0))
+    orchestrator = VoiceSessionOrchestrator(
+        controller=controller,
+        llm_provider=StartThenTimerRouter(),
+        timing=VoiceTimingConfig(control_loop_ms=10),
+    )
+    session_id = "browser-session"
+
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(event=VoiceEventType.USER_TURN, transport=VoiceTransportKind.BROWSER, session_id=session_id, text="Analyze the repo."),
+    )
+    first_task_id = orchestrator.sessions[session_id].active_task_id
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(event=VoiceEventType.USER_TURN, transport=VoiceTransportKind.BROWSER, session_id=session_id, text="Set a five minute timer."),
+    )
+
+    state = orchestrator.sessions[session_id]
+    assert state.active_task_id == first_task_id
+    assert len(state.active_timers) == 1
+    assert len(controller.tasks) == 1
+    timer_tool_messages = [
+        message for message in state.conversation_history
+        if message.get("role") == "tool" and message.get("name") == "start_timer"
+    ]
+    assert timer_tool_messages
+    assert timer_tool_messages[-1].get("tool_call_id", "").startswith("call_start_timer_")
+    await orchestrator.stop_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_proactively_delivers_timer_expiry_when_idle() -> None:
+    now = datetime(2026, 5, 26, 14, 0, 0)
+
+    def clock() -> datetime:
+        return now
+
+    class TimerComposer:
+        async def compose_runtime_event_result(
+            self,
+            system_state,
+            conversation_history,
+            pending_item,
+            event_payload,
+            fallback,
+        ):
+            assert pending_item["kind"] == "timer"
+            assert event_payload["type"] == "timer"
+            return "Your one minute timer is done."
+
+    controller = AgentController(runtime=FakeRuntime(delay_seconds=0.01))
+    orchestrator = VoiceSessionOrchestrator(
+        controller=controller,
+        llm_provider=TimerComposer(),
+        clock=clock,
+        timing=VoiceTimingConfig(control_loop_ms=10),
+    )
+    session_id = "browser-session"
+    state = await orchestrator.start_session(session_id, VoiceTransportKind.BROWSER)
+    await orchestrator.drain_events(session_id)
+
+    await orchestrator._execute_native_tool(state, "start_timer", {"duration_ms": 1000, "label": "one minute"})
+    now = now + timedelta(milliseconds=1200)
+
+    delivered = await wait_for_voice_event(orchestrator, session_id, VoiceEventType.ASSISTANT_RESPONSE)
+
+    assert delivered.text == "Your one minute timer is done."
+    assert delivered.metadata["durable"] is True
+    assert delivered.metadata["delivery_kind"] == "timer"
+    assert state.recent_completed_events[-1]["type"] == "timer"
+    await orchestrator.stop_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_waits_until_assistant_is_idle_to_deliver_timer_expiry() -> None:
+    now = datetime(2026, 5, 26, 14, 0, 0)
+
+    def clock() -> datetime:
+        return now
+
+    class TimerComposer:
+        async def compose_runtime_event_result(
+            self,
+            system_state,
+            conversation_history,
+            pending_item,
+            event_payload,
+            fallback,
+        ):
+            return "Your run timer is done."
+
+    controller = AgentController(runtime=FakeRuntime(delay_seconds=0.01))
+    orchestrator = VoiceSessionOrchestrator(
+        controller=controller,
+        llm_provider=TimerComposer(),
+        clock=clock,
+        timing=VoiceTimingConfig(control_loop_ms=10),
+    )
+    session_id = "browser-session"
+    state = await orchestrator.start_session(session_id, VoiceTransportKind.BROWSER)
+    await orchestrator.drain_events(session_id)
+
+    await orchestrator._execute_native_tool(state, "start_timer", {"duration_ms": 1000, "label": "run"})
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(event=VoiceEventType.ASSISTANT_SPEECH_STARTED, transport=VoiceTransportKind.BROWSER, session_id=session_id),
+    )
+    now = now + timedelta(milliseconds=1200)
+    await asyncio.sleep(0.05)
+    events = await orchestrator.drain_events(session_id)
+
+    assert all(event.text != "Your run timer is done." for event in events)
+
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(event=VoiceEventType.ASSISTANT_SPEECH_ENDED, transport=VoiceTransportKind.BROWSER, session_id=session_id, metadata={"completed": True}),
+    )
+    delivered = await wait_for_voice_event(orchestrator, session_id, VoiceEventType.ASSISTANT_RESPONSE)
+
+    assert delivered.text == "Your run timer is done."
+    await orchestrator.stop_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_delivers_timer_expiry_before_progress_update() -> None:
+    now = datetime(2026, 5, 26, 14, 0, 0)
+
+    def clock() -> datetime:
+        return now
+
+    class ProgressRouter:
+        async def route_turn(self, user_text, system_state, conversation_history):
+            return {
+                "type": "tool_call",
+                "tool": "start_task",
+                "arguments": {"task": user_text},
+                "assistant_response": "I'll check that now.",
+            }
+
+        async def decide_progress(self, progress_state, conversation_history):
+            return {"action": "speak_progress", "message": "Still working on it.", "next_check_ms": 1000}
+
+        async def compose_runtime_event_result(
+            self,
+            system_state,
+            conversation_history,
+            pending_item,
+            event_payload,
+            fallback,
+        ):
+            return "Your one minute timer is done."
+
+    controller = AgentController(runtime=FakeRuntime(delay_seconds=1.0))
+    orchestrator = VoiceSessionOrchestrator(
+        controller=controller,
+        llm_provider=ProgressRouter(),
+        clock=clock,
+        timing=VoiceTimingConfig(control_loop_ms=10, first_progress_check_ms=20),
+    )
+    session_id = "browser-session"
+
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(event=VoiceEventType.USER_TURN, transport=VoiceTransportKind.BROWSER, session_id=session_id, text="Check weather."),
+    )
+    state = orchestrator.sessions[session_id]
+    await orchestrator.drain_events(session_id)
+    await orchestrator._execute_native_tool(state, "start_timer", {"duration_ms": 1000, "label": "one minute"})
+    now = now + timedelta(milliseconds=1200)
+    await asyncio.sleep(0.08)
+    events = await orchestrator.drain_events(session_id)
+    relevant = [event for event in events if event.event in {VoiceEventType.ASSISTANT_RESPONSE, VoiceEventType.TASK_STATUS}]
+
+    assert relevant
+    assert relevant[0].text == "Your one minute timer is done."
+    await orchestrator.stop_session(session_id)
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_delivers_supervisor_composed_tool_result() -> None:
     class ComposingRouter:
         async def route_turn(self, user_text, system_state, conversation_history):
@@ -173,6 +757,78 @@ async def test_orchestrator_delivers_supervisor_composed_tool_result() -> None:
 
     assert delivered.text == "Composed answer for: Demo result for: Check demo weather."
     assert any(msg.get("role") == "tool" and msg.get("tool_call_id", "").startswith("result_") for msg in orchestrator.sessions[session_id].conversation_history)
+    await orchestrator.stop_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_keeps_interrupted_delivery_as_pending_unheard() -> None:
+    controller = AgentController(runtime=FakeRuntime(delay_seconds=0.01))
+    orchestrator = VoiceSessionOrchestrator(
+        controller=controller,
+        timing=VoiceTimingConfig(control_loop_ms=10, first_progress_check_ms=5000),
+    )
+    session_id = "browser-session"
+
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(event=VoiceEventType.USER_TURN, transport=VoiceTransportKind.BROWSER, session_id=session_id, text="Check Bangalore weather."),
+    )
+    delivered = await wait_for_voice_event(orchestrator, session_id, VoiceEventType.DELIVERY_READY)
+    delivery_id = delivered.metadata["delivery_id"]
+
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(
+            event=VoiceEventType.ASSISTANT_SPEECH_STARTED,
+            transport=VoiceTransportKind.BROWSER,
+            session_id=session_id,
+            metadata={"delivery_id": delivery_id},
+        ),
+    )
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(
+            event=VoiceEventType.ASSISTANT_SPEECH_ENDED,
+            transport=VoiceTransportKind.BROWSER,
+            session_id=session_id,
+            metadata={"delivery_id": delivery_id, "completed": False, "reason": "interrupted"},
+        ),
+    )
+
+    payload = orchestrator._session_state_payload(orchestrator.sessions[session_id])
+    assert payload["pending_unheard_items"][0]["delivery_id"] == delivery_id
+    assert payload["pending_unheard_items"][0]["status"] == "interrupted"
+    await orchestrator.stop_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_removes_completed_delivery_from_pending_unheard() -> None:
+    controller = AgentController(runtime=FakeRuntime(delay_seconds=0.01))
+    orchestrator = VoiceSessionOrchestrator(
+        controller=controller,
+        timing=VoiceTimingConfig(control_loop_ms=10, first_progress_check_ms=5000),
+    )
+    session_id = "browser-session"
+
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(event=VoiceEventType.USER_TURN, transport=VoiceTransportKind.BROWSER, session_id=session_id, text="Check Bangalore weather."),
+    )
+    delivered = await wait_for_voice_event(orchestrator, session_id, VoiceEventType.DELIVERY_READY)
+    delivery_id = delivered.metadata["delivery_id"]
+
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(
+            event=VoiceEventType.ASSISTANT_SPEECH_ENDED,
+            transport=VoiceTransportKind.BROWSER,
+            session_id=session_id,
+            metadata={"delivery_id": delivery_id, "completed": True},
+        ),
+    )
+
+    payload = orchestrator._session_state_payload(orchestrator.sessions[session_id])
+    assert payload["pending_unheard_items"] == []
     await orchestrator.stop_session(session_id)
 
 

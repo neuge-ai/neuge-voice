@@ -14,7 +14,7 @@ from nextgen_voice_agent.models.task import (
     StartTaskResponse,
     TaskStatusResponse,
 )
-from nextgen_voice_agent.models.voice import VoiceEvent
+from nextgen_voice_agent.models.voice import VoiceEvent, VoiceTransportKind
 from nextgen_voice_agent.config import get_settings
 from nextgen_voice_agent.server.dependencies import get_controller, get_tts_provider, get_voice_orchestrator
 from nextgen_voice_agent.server.realtime import build_realtime_session_config, create_openai_realtime_client_secret
@@ -71,14 +71,28 @@ async def call_realtime_tool(
     tool_name: str,
     request: RealtimeToolCallRequest,
     controller: AgentController = Depends(get_controller),
+    orchestrator: VoiceSessionOrchestrator = Depends(get_voice_orchestrator),
 ) -> dict[str, object]:
     args = request.arguments
     try:
         if tool_name == "start_codex_task":
-            result = await controller.start_task(
-                StartTaskRequest(task=str(args["task"]), context=args.get("context") if args.get("context") else None)
-            )
-            return result.model_dump(mode="json")
+            task_text = str(args["task"])
+            try:
+                result = await controller.start_task(
+                    StartTaskRequest(task=task_text, context=args.get("context") if args.get("context") else None)
+                )
+                return {"ok": True, **result.model_dump(mode="json")}
+            except TaskConflictError:
+                active_task = controller.tasks.get(controller.active_task_id or "")
+                return {
+                    "ok": False,
+                    "error_code": "codex_task_conflict",
+                    "recoverable": True,
+                    "message": "A Codex task is already active.",
+                    "attempted_task": task_text,
+                    "active_task": active_task.model_dump(mode="json") if active_task else None,
+                    "allowed_next_actions": ["cancel_active_task", "keep_active_task", "use_native_tool", "answer_directly"],
+                }
         if tool_name == "amend_codex_task":
             result = await controller.amend_task(
                 str(args["task_id"]),
@@ -103,6 +117,23 @@ async def call_realtime_tool(
                 bool(args["approved"]),
             )
             return result.model_dump(mode="json")
+        if tool_name in {
+            "start_timer",
+            "get_timer_status",
+            "list_active_timers",
+            "cancel_timer",
+            "start_activity",
+            "get_activity_status",
+            "list_active_activities",
+            "end_activity",
+            "cancel_activity",
+            "list_active_background_tasks",
+            "get_background_task_status",
+            "cancel_background_task",
+        }:
+            state = await orchestrator.start_session("realtime-default", VoiceTransportKind.BROWSER)
+            normalized_args = {key: value for key, value in args.items() if value is not None}
+            return await orchestrator._execute_native_tool(state, tool_name, normalized_args)
     except KeyError as exc:
         raise HTTPException(status_code=422, detail=f"Missing required argument: {exc.args[0]}") from exc
     except TaskNotFoundError as exc:
@@ -239,4 +270,3 @@ async def webrtc_offer(
         offer_type=request.type
     )
     return {"sdp": answer.sdp, "type": answer.type}
-

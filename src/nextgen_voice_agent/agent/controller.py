@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 
 from nextgen_voice_agent.agent.prompts import build_codex_task_prompt
@@ -229,12 +230,15 @@ class AgentController:
         except asyncio.CancelledError:
             return
         except Exception as exc:
+            logging.exception("Task worker crashed for %s", request.task_id)
             task = self.tasks.get(request.task_id)
             if task is None:
                 return
             task.status = TaskStatus.FAILED
             task.user_visible_status = "Task failed"
             task.touch()
+            if self.active_task_id == request.task_id:
+                self.active_task_id = None
             await self.event_hub.publish(
                 TaskFailedEvent(
                     task_id=task.task_id,
@@ -242,6 +246,8 @@ class AgentController:
                     error=str(exc),
                 )
             )
+        finally:
+            self._workers.pop(request.task_id, None)
 
     async def _handle_progress(self, progress: RuntimeProgress) -> None:
         task = self.tasks.get(progress.task_id)
@@ -293,6 +299,8 @@ class AgentController:
             task.status = TaskStatus.FAILED
             task.user_visible_status = result.error or "Task failed"
             task.touch()
+            if self.active_task_id == task.task_id:
+                self.active_task_id = None
             await self.event_hub.publish(
                 TaskFailedEvent(
                     task_id=task.task_id,
@@ -303,6 +311,8 @@ class AgentController:
             return
 
         if result.status == RuntimeResultStatus.CANCELLED:
+            if self.active_task_id == task.task_id:
+                self.active_task_id = None
             return
 
         self.results[task.task_id] = result
@@ -345,5 +355,4 @@ class AgentController:
 
     @staticmethod
     def _acknowledge(task_text: str) -> str:
-        cleaned = task_text.strip().rstrip(".")
-        return f"Sure, I will work on: {cleaned}."
+        return "I'll look into that in the background."
