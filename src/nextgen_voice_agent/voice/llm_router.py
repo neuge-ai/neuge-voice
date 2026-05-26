@@ -48,7 +48,12 @@ ROUTER_TOOLS = [
         "type": "function",
         "function": {
             "name": "start_task",
-            "description": "Start a new powerful background task to write code, search the web, or run commands. Use this when the user's request requires heavy lifting.",
+            "description": (
+                "Start a new powerful background task to write code, search the web, or run commands. "
+                "Use this when the user's request requires heavy lifting. For follow-up requests, inspect "
+                "the conversation history and include relevant prior facts directly in the task argument; "
+                "ask the background task only for missing/new information and comparison work."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -111,12 +116,15 @@ class OrchestratorLLMProvider:
                     "Your job is to manage the flow of conversation and delegate heavy work to background tasks.\n"
                     "Answer simple conversational turns directly. Use tools only when the app must start, amend, or cancel a background task.\n\n"
                     "CRITICAL INSTRUCTIONS ON TOOL USE:\n"
-                    "- If the user asks to write code, search the web, check the weather, or do any complex task, call `start_task`.\n"
+                    "- If the user asks to write code, search the web, check the weather, or do any complex task, YOU MUST CALL `start_task`.\n"
+                    "- Before calling `start_task`, inspect the conversation history and completed tool results.\n"
+                    "- For follow-up requests like 'compare it with X', resolve pronouns and include relevant prior facts in `task`.\n"
+                    "- If prior tool output already answers part of the request, preserve it and ask the tool only for missing/new information.\n"
                     "- If the user asks to change a running task, call `amend_task`.\n"
-                    "- If a task is completed and the user asks a follow-up, call `start_task` with the follow-up and prior context.\n"
+                    "- If a task is completed and the user asks a follow-up, call `start_task` with a self-contained task that names the prior facts and the new ask.\n"
                     "- If the user asks to stop a running task, call `cancel_task`.\n"
                     "- If no tool is needed, respond with normal assistant content.\n"
-                    "- Never call a tool not explicitly listed in your schema.\n\n"
+                    "- Never attempt to call a tool not explicitly listed in your schema.\n\n"
                     f"Current System State:\n{system_state}\n"
                 ),
             }
@@ -146,6 +154,7 @@ class OrchestratorLLMProvider:
                     }
                 arguments = json.loads(tool_call.function.arguments)
                 assistant_response = sanitize_user_facing_text(message.content or "", "I'll start that now.")
+                
                 decision: RouterDecision = {
                     "type": "tool_call",
                     "tool": function_name,

@@ -6,6 +6,7 @@ from datetime import datetime
 import pytest
 
 from nextgen_voice_agent.agent.controller import AgentController
+from nextgen_voice_agent.models.runtime import RuntimeResult, RuntimeResultStatus
 from nextgen_voice_agent.models.task import TaskStatus
 from nextgen_voice_agent.models.voice import VoiceEvent, VoiceEventType, VoiceTransportKind
 from nextgen_voice_agent.runtimes.fake import FakeRuntime
@@ -172,6 +173,34 @@ async def test_orchestrator_delivers_supervisor_composed_tool_result() -> None:
 
     assert delivered.text == "Composed answer for: Demo result for: Check demo weather."
     assert any(msg.get("role") == "tool" and msg.get("tool_call_id", "").startswith("result_") for msg in orchestrator.sessions[session_id].conversation_history)
+    await orchestrator.stop_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_builds_grounded_context_with_prior_completed_results() -> None:
+    controller = AgentController(runtime=FakeRuntime(delay_seconds=0.01))
+    orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10))
+    session_id = "browser-session"
+    state = await orchestrator.start_session(session_id, VoiceTransportKind.BROWSER)
+    state.conversation_history.append({"role": "user", "content": "Check the weather in Delhi today."})
+    orchestrator._append_tool_result_history(
+        state,
+        RuntimeResult(
+            task_id="task_delhi",
+            generation=1,
+            status=RuntimeResultStatus.COMPLETED,
+            spoken_answer="Delhi today is around 42 C with overcast clouds.",
+            technical_summary="weather lookup",
+        ),
+    )
+    state.conversation_history.append({"role": "assistant", "content": "Delhi today is around 42 C with overcast clouds."})
+
+    context = orchestrator._build_task_context(state, "Compare it against Calcutta.")
+
+    assert "Prior completed tool results to preserve when relevant" in context
+    assert "Delhi today is around 42 C with overcast clouds." in context
+    assert "Current user request:\nCompare it against Calcutta." in context
+    assert "Conversation transcript:" in context
     await orchestrator.stop_session(session_id)
 
 

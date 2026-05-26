@@ -17,6 +17,9 @@ Important:
 - Return concise facts and conclusions in `spoken_answer`; do not over-polish the wording.
 - Include key calculations or reasoning in `technical_summary`.
 - Include sources/tools used when applicable.
+- If Context includes prior completed tool results, use those facts for follow-up requests instead of silently re-estimating them.
+- For comparison follow-ups, fetch only the missing side when prior results already provide one side.
+- If fresh data conflicts with prior completed results, mention the conflict in `technical_summary`.
 - Do not include long logs unless asked.
 - Do not perform irreversible actions without explicit user approval.
 - If the user later amends the task, incorporate the amendment into this same task.
