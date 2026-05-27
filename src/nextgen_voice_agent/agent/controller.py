@@ -87,6 +87,7 @@ class AgentController:
             original_request=request.task,
             status=TaskStatus.ACKNOWLEDGED,
             type=request.mode.value,
+            ui_title=request.ui_title,
             priority=request.urgency,
             user_visible_status="Starting background task",
         )

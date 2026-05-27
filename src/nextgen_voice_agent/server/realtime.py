@@ -41,8 +41,9 @@ def build_realtime_session_config(settings: Settings) -> RealtimeSessionConfig:
                     "properties": {
                         "task": {"type": "string"},
                         "context": {"type": ["string", "null"]},
+                        "ui_title": {"type": "string", "description": "A concise 2-3 word title summarizing what this specific tool execution is doing, for display on the UI."},
                     },
-                    "required": ["task", "context"],
+                    "required": ["task", "context", "ui_title"],
                 },
             ),
             RealtimeTool(
@@ -115,8 +116,9 @@ def build_realtime_session_config(settings: Settings) -> RealtimeSessionConfig:
                         "duration_ms": {"type": "integer"},
                         "label": {"type": "string"},
                         "reason": {"type": ["string", "null"]},
+                        "ui_title": {"type": "string", "description": "A concise 2-3 word title summarizing what this specific timer is doing, for display on the UI."},
                     },
-                    "required": ["duration_ms", "label", "reason"],
+                    "required": ["duration_ms", "label", "reason", "ui_title"],
                 },
             ),
             RealtimeTool(
@@ -155,8 +157,9 @@ def build_realtime_session_config(settings: Settings) -> RealtimeSessionConfig:
                         "label": {"type": "string"},
                         "target_duration_ms": {"type": ["integer", "null"]},
                         "target_distance_meters": {"type": ["integer", "null"]},
+                        "ui_title": {"type": "string", "description": "A concise 2-3 word title summarizing what this specific activity is doing, for display on the UI."},
                     },
-                    "required": ["activity_type", "label", "target_duration_ms", "target_distance_meters"],
+                    "required": ["activity_type", "label", "target_duration_ms", "target_distance_meters", "ui_title"],
                 },
             ),
             RealtimeTool(

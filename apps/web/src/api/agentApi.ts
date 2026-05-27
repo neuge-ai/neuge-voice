@@ -109,6 +109,21 @@ export async function getHealthStatus(): Promise<HealthStatus> {
   return response.json();
 }
 
+export type ActiveTool = {
+  id: string;
+  type: string;
+  title: string;
+  started_at: string;
+};
+
+export async function getActiveTools(): Promise<{ tools: ActiveTool[] }> {
+  const response = await fetch(`${API_BASE}/realtime/active-tools`);
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  return response.json();
+}
+
 export async function synthesizeSpeech(text: string, signal?: AbortSignal): Promise<TtsResult> {
   const response = await fetch(`${API_BASE}/tts/synthesize`, {
     method: "POST",

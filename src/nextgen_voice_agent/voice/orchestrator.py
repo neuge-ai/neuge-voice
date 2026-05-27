@@ -94,6 +94,7 @@ class SessionTimer:
     duration_ms: int
     reason: str | None = None
     status: str = "running"
+    ui_title: str | None = None
 
     @property
     def ends_at(self) -> datetime:
@@ -109,6 +110,7 @@ class SessionActivity:
     target_duration_ms: int | None = None
     target_distance_meters: int | None = None
     status: str = "active"
+    ui_title: str | None = None
 
 
 @dataclass
@@ -1160,6 +1162,7 @@ class VoiceSessionOrchestrator:
             "remaining_time_human": format_ms_to_human(remaining_ms),
             "status": timer.status,
             "reason": timer.reason,
+            "ui_title": timer.ui_title,
         }
 
     def _activity_payload(self, activity: SessionActivity, now: datetime) -> dict[str, Any]:
@@ -1174,6 +1177,7 @@ class VoiceSessionOrchestrator:
             "target_duration_ms": activity.target_duration_ms,
             "target_distance_meters": activity.target_distance_meters,
             "status": activity.status,
+            "ui_title": activity.ui_title,
         }
 
     def _task_payload(self, state: VoiceSessionState, task: Any, now: datetime) -> dict[str, Any]:
@@ -1188,6 +1192,7 @@ class VoiceSessionOrchestrator:
             "last_meaningful_progress_ms_ago": max(0, last_progress_ms_ago),
             "last_spoken_update_ms_ago": int(self._elapsed_ms(state.last_progress_spoken_at)) if state.last_progress_spoken_at else None,
             "progress_update_count": state.progress_update_count,
+            "ui_title": getattr(task, "ui_title", None),
         }
 
     def _build_progress_state(self, state: VoiceSessionState, task: Any, meaningful_progress: bool) -> dict[str, Any]:
@@ -1214,6 +1219,7 @@ class VoiceSessionOrchestrator:
                 duration_ms=duration_ms,
                 reason=str(args["reason"]) if args.get("reason") is not None else None,
                 started_at=self.clock(),
+                ui_title=args.get("ui_title"),
             )
             state.active_timers[timer.timer_id] = timer
             return {"timer": self._timer_payload(timer, self.clock()), "message": f"I started the {timer.label} timer."}
@@ -1234,6 +1240,7 @@ class VoiceSessionOrchestrator:
                 target_duration_ms=int(args["target_duration_ms"]) if args.get("target_duration_ms") is not None else None,
                 target_distance_meters=int(args["target_distance_meters"]) if args.get("target_distance_meters") is not None else None,
                 started_at=self.clock(),
+                ui_title=args.get("ui_title"),
             )
             state.active_activities[activity.activity_id] = activity
             return {"activity": self._activity_payload(activity, self.clock()), "message": f"I started tracking {activity.label}."}
