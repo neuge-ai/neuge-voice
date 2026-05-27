@@ -85,6 +85,7 @@ class Task(BaseModel):
     generation: int = Field(default=1, ge=1)
     status: TaskStatus = TaskStatus.CREATED
     type: str = "general"
+    ui_title: str | None = None
     original_request: str
     latest_user_constraints: list[str] = Field(default_factory=list)
     codex_session_id: str | None = None
@@ -103,6 +104,7 @@ class Task(BaseModel):
 class StartTaskRequest(BaseModel):
     task: str = Field(min_length=1)
     context: str | None = None
+    ui_title: str | None = None
     mode: TaskMode = TaskMode.GENERAL
     urgency: TaskUrgency = TaskUrgency.NORMAL
     requires_user_approval: bool = False

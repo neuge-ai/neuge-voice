@@ -1,27 +1,16 @@
-import React, { useMemo } from "react";
 import { type AgentEvent } from "../../api/agentApi";
+import { useActiveTools } from "../../hooks/useActiveTools";
 
 export function SideNav({ events = [], isOpen = false, onClose = () => {} }: { events?: AgentEvent[], isOpen?: boolean, onClose?: () => void }) {
-  // Derive active tasks from events
-  const activeTools = useMemo(() => {
-    const toolsMap = new Map<string, any>();
-    
-    events.forEach(e => {
-      if (!e.task_id) return;
-      if (e.event === "task_started") {
-        toolsMap.set(e.task_id, { id: e.task_id, name: "Background Task", desc: "Running..." });
-      } else if (e.event === "task_progress") {
-        const existing = toolsMap.get(e.task_id);
-        if (existing) {
-          existing.desc = "In Progress";
-        }
-      } else if (e.event === "task_completed" || e.event === "task_cancelled" || e.event === "task_failed") {
-        toolsMap.delete(e.task_id);
-      }
-    });
+  const { activeTools } = useActiveTools();
 
-    return Array.from(toolsMap.values());
-  }, [events]);
+  const formatElapsed = (ms: number) => {
+    const totalSeconds = Math.floor(ms / 1000);
+    const m = Math.floor(totalSeconds / 60);
+    const s = totalSeconds % 60;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+  };
 
   return (
     <nav className={`fixed inset-0 md:inset-auto md:left-0 md:top-0 h-full w-full md:w-[320px] flex flex-col transition-transform duration-300 md:translate-x-0 z-[70] md:z-40 ${isOpen ? 'translate-x-0' : '-translate-x-full'} glass-panel max-md:!bg-surface-dim/80 max-md:!backdrop-blur-3xl shadow-[8px_0_32px_rgba(0,0,0,0.3)] md:shadow-2xl border-y-0 border-l-0`}>
@@ -63,14 +52,16 @@ export function SideNav({ events = [], isOpen = false, onClose = () => {} }: { e
               <div key={tool.id} className="glass-recessed p-4 rounded-xl flex items-center justify-between group hover:bg-white/[0.02] transition-all border border-white/5">
                 <div className="flex items-center gap-4">
                   <div className="w-8 h-8 rounded-full flex items-center justify-center text-slate-200 group-hover:text-secondary transition-colors">
-                    <span className="material-symbols-outlined text-[18px]">routine</span>
+                    <span className="material-symbols-outlined text-[18px]">
+                      {tool.type === 'timer' ? 'timer' : tool.type === 'activity' ? 'directions_run' : 'routine'}
+                    </span>
                   </div>
                   <div>
-                    <div className="font-body-md text-sm text-white font-semibold tracking-wide">{tool.name}</div>
-                    <div className="font-metadata-sm text-[10px] text-slate-300 mt-0.5">{tool.desc}</div>
+                    <div className="font-body-md text-sm text-white font-semibold tracking-wide truncate max-w-[140px]" title={tool.title || "Background Task"}>{tool.title || "Background Task"}</div>
+                    <div className="font-metadata-sm text-[10px] text-slate-300 mt-0.5 uppercase tracking-wider">{tool.type}</div>
                   </div>
                 </div>
-                <div className="relative flex h-2 w-2"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-secondary opacity-75"></span><span className="relative inline-flex rounded-full h-2 w-2 bg-secondary"></span></div>
+                <div className="text-secondary font-mono text-[10px] font-bold pl-2 tracking-widest">{formatElapsed(tool.elapsed_ms)}</div>
               </div>
             ))
           )}

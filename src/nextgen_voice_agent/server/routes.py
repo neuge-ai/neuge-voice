@@ -12,6 +12,7 @@ from nextgen_voice_agent.models.task import (
     CancelTaskResponse,
     StartTaskRequest,
     StartTaskResponse,
+    TaskStatus,
     TaskStatusResponse,
 )
 from nextgen_voice_agent.models.voice import VoiceEvent, VoiceTransportKind
@@ -79,7 +80,11 @@ async def call_realtime_tool(
             task_text = str(args["task"])
             try:
                 result = await controller.start_task(
-                    StartTaskRequest(task=task_text, context=args.get("context") if args.get("context") else None)
+                    StartTaskRequest(
+                        task=task_text,
+                        context=args.get("context") if args.get("context") else None,
+                        ui_title=str(args["ui_title"]) if args.get("ui_title") else None,
+                    )
                 )
                 return {"ok": True, **result.model_dump(mode="json")}
             except TaskConflictError:
@@ -251,6 +256,43 @@ class WebRTCOfferRequest(BaseModel):
     sdp: str
     type: str
     session_id: str
+
+@router.get("/realtime/active-tools", response_model=dict[str, object])
+async def get_active_tools(
+    controller: AgentController = Depends(get_controller),
+    orchestrator: VoiceSessionOrchestrator = Depends(get_voice_orchestrator),
+) -> dict[str, object]:
+    tools = []
+    
+    for task in controller.tasks.values():
+        if task.status in {TaskStatus.RUNNING, TaskStatus.AMENDING, TaskStatus.WAITING_FOR_APPROVAL, TaskStatus.WAITING_FOR_TOOL, TaskStatus.WAITING_FOR_USER_CLARIFICATION}:
+            tools.append({
+                "id": task.task_id,
+                "type": "codex",
+                "title": getattr(task, "ui_title", None) or "Background Task",
+                "started_at": task.created_at.astimezone().isoformat(),
+            })
+            
+    for session in orchestrator.sessions.values():
+        for timer in session.active_timers.values():
+            if timer.status == "running":
+                tools.append({
+                    "id": timer.timer_id,
+                    "type": "timer",
+                    "title": getattr(timer, "ui_title", None) or "Timer",
+                    "started_at": timer.started_at.astimezone().isoformat(),
+                })
+                
+        for activity in session.active_activities.values():
+            if activity.status == "active":
+                tools.append({
+                    "id": activity.activity_id,
+                    "type": "activity",
+                    "title": getattr(activity, "ui_title", None) or "Activity",
+                    "started_at": activity.started_at.astimezone().isoformat(),
+                })
+                
+    return {"tools": tools}
 
 webrtc_manager = None
 
