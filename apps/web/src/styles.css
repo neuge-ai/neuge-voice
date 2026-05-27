@@ -9,6 +9,20 @@
     overflow: hidden; /* Prevent scrolling on main dashboard */
     font-family: 'Geist', sans-serif;
   }
+
+  .material-symbols-outlined {
+    font-family: 'Material Symbols Outlined';
+    font-weight: normal;
+    font-style: normal;
+    font-size: 24px;
+    line-height: 1;
+    display: inline-block;
+    white-space: nowrap;
+    direction: ltr;
+    font-feature-settings: 'liga';
+    -webkit-font-feature-settings: 'liga';
+    -webkit-font-smoothing: antialiased;
+  }
 }
 
 /* Mesh Gradient Background */
@@ -22,11 +36,57 @@
     background-attachment: fixed;
 }
 
-.glass-panel {
-    background: rgba(11, 19, 38, 0.4);
-    backdrop-filter: blur(24px);
-    -webkit-backdrop-filter: blur(24px);
-    border: 1px solid rgba(255, 255, 255, 0.1);
+@layer components {
+  .glass-panel {
+      background: rgba(11, 19, 38, 0.4);
+      backdrop-filter: blur(24px);
+      -webkit-backdrop-filter: blur(24px);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.1), 0 8px 32px rgba(0, 0, 0, 0.3);
+  }
+
+  .glass-recessed {
+      background: rgba(0, 0, 0, 0.2);
+      box-shadow: inset 0 2px 10px rgba(0, 0, 0, 0.3), inset 0 0 0 0.5px rgba(255, 255, 255, 0.05);
+  }
+
+  .glass-elevated {
+      background: rgba(255, 255, 255, 0.03);
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2), inset 0 0 0 0.5px rgba(255, 255, 255, 0.1);
+  }
+}
+
+main {
+    transition: padding-right 0.5s cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+body.panel-open main {
+    padding-right: 480px;
+}
+
+@media (max-width: 1024px) {
+    body.panel-open main { padding-right: 400px; }
+}
+@media (max-width: 768px) {
+    body.panel-open main { padding-right: 0; }
+}
+
+body.panel-open #stage-container {
+    transform: scale(0.85);
+}
+
+#activityLogPanel .overflow-y-auto::-webkit-scrollbar {
+    width: 2px;
+}
+#activityLogPanel .overflow-y-auto::-webkit-scrollbar-track {
+    background: transparent;
+}
+#activityLogPanel .overflow-y-auto::-webkit-scrollbar-thumb {
+    background: rgba(208, 188, 255, 0.1);
+    border-radius: 10px;
+}
+#activityLogPanel .overflow-y-auto::-webkit-scrollbar-thumb:hover {
+    background: rgba(208, 188, 255, 0.2);
 }
 
 /* Mouse tracking background glow */
@@ -235,16 +295,3 @@
     display: none;
 }
 
-.material-symbols-outlined {
-  font-family: 'Material Symbols Outlined';
-  font-weight: normal;
-  font-style: normal;
-  font-size: 24px;
-  line-height: 1;
-  display: inline-block;
-  white-space: nowrap;
-  direction: ltr;
-  font-feature-settings: 'liga';
-  -webkit-font-feature-settings: 'liga';
-  -webkit-font-smoothing: antialiased;
-}
