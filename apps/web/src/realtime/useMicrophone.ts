@@ -22,6 +22,7 @@ const SPEECH_END_MS = 700;
 export function useMicrophone(options: UseMicrophoneOptions = {}) {
   const [state, setState] = useState<MicState>("idle");
   const [vadState, setVadState] = useState<VadState>("silent");
+  const [permissionState, setPermissionState] = useState<PermissionState | null>(null);
   const [level, setLevel] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [captureSettings, setCaptureSettings] = useState<MicCaptureSettings | null>(null);
@@ -40,6 +41,19 @@ export function useMicrophone(options: UseMicrophoneOptions = {}) {
   useEffect(() => {
     onVoiceEventRef.current = options.onVoiceEvent;
   }, [options.onVoiceEvent]);
+
+  useEffect(() => {
+    if (navigator.permissions && navigator.permissions.query) {
+      navigator.permissions.query({ name: 'microphone' as PermissionName })
+        .then(permissionStatus => {
+          setPermissionState(permissionStatus.state);
+          permissionStatus.onchange = () => {
+            setPermissionState(permissionStatus.state);
+          };
+        })
+        .catch(e => console.warn("Permissions API not supported for microphone", e));
+    }
+  }, []);
 
   const emit = useCallback((event: VoiceEventInput) => {
     void onVoiceEventRef.current?.(event);
@@ -190,5 +204,5 @@ export function useMicrophone(options: UseMicrophoneOptions = {}) {
     setState("idle");
   }, [emit, stopAudioGraph]);
 
-  return { state, vadState, level, error, captureSettings, start, stop, stream: streamRef.current };
+  return { state, vadState, level, error, captureSettings, permissionState, start, stop, stream: streamRef.current };
 }
