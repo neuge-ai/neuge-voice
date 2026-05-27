@@ -112,6 +112,7 @@ export function useAgentSession() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioObjectUrlRef = useRef<string | null>(null);
   const ttsQueue = useRef<TtsPlaybackQueue>(new TtsPlaybackQueue());
+  const ttsPausedRef = useRef(false);
   
   const [assistantSpeaking, setAssistantSpeaking] = useState(false);
   const [backendConnected, setBackendConnected] = useState(false);
@@ -141,11 +142,35 @@ export function useAgentSession() {
       }
     }
     setAssistantSpeaking(false);
+    ttsPausedRef.current = false;
   }, [transport]);
 
   const stopCurrentSpeech = useCallback(() => {
     flushTtsQueue();
   }, [flushTtsQueue]);
+
+  const pauseTts = useCallback(() => {
+    ttsPausedRef.current = true;
+    if (audioRef.current) {
+      audioRef.current.pause();
+    }
+    if ("speechSynthesis" in window) {
+      window.speechSynthesis.pause();
+    }
+  }, []);
+
+  const resumeTts = useCallback(() => {
+    ttsPausedRef.current = false;
+    if (audioRef.current) {
+      if (transport.audioContext.state === 'suspended') {
+        transport.audioContext.resume().catch(e => console.warn("Could not resume AudioContext:", e));
+      }
+      audioRef.current.play().catch(e => setError(describePlaybackException(e)));
+    }
+    if ("speechSynthesis" in window) {
+      window.speechSynthesis.resume();
+    }
+  }, [transport]);
 
   const playTtsItem = useCallback(
     async (item: TtsQueueItem): Promise<void> => {
@@ -261,10 +286,21 @@ export function useAgentSession() {
                 finish();
               };
               a.onerror = finish;
-              a.play().catch((exc) => {
-                setError(describePlaybackException(exc));
-                finish();
-              });
+              const playWhenReady = async () => {
+                while (ttsPausedRef.current && !item.cancelled) {
+                  await new Promise(r => setTimeout(r, 50));
+                }
+                if (item.cancelled) return;
+                a.play().catch((exc) => {
+                  if (exc instanceof DOMException && exc.name === 'AbortError') {
+                    console.warn("Audio play() was aborted by pause(). Ignoring.", exc);
+                    return;
+                  }
+                  setError(describePlaybackException(exc));
+                  finish();
+                });
+              };
+              void playWhenReady();
             } catch (exc) {
               setError(exc instanceof Error ? exc.message : "Audio decode failed");
               resolveOnce();
@@ -309,7 +345,14 @@ export function useAgentSession() {
             setError(`Browser speech synthesis failed: ${e.error || "unknown"}`);
             finish();
           };
-          window.speechSynthesis.speak(utterance);
+          const playWhenReady = async () => {
+            while (ttsPausedRef.current && !item.cancelled) {
+              await new Promise(r => setTimeout(r, 50));
+            }
+            if (item.cancelled) return;
+            window.speechSynthesis.speak(utterance);
+          };
+          void playWhenReady();
           window.setTimeout(() => {
             if (utteranceRef.current === utterance && !window.speechSynthesis.speaking) {
               window.speechSynthesis.pause();
@@ -330,11 +373,14 @@ export function useAgentSession() {
       setVoiceEvents((current) => [...[...outbound].reverse(), ...current].slice(0, 20));
 
       for (const event of outbound) {
-        if (
-          event.event === "stop_assistant_audio" ||
-          event.event === "speech_started"
-        ) {
+        if (event.event === "stop_assistant_audio") {
           flushTtsQueue();
+        }
+        if (event.event === "pause_assistant_audio") {
+          pauseTts();
+        }
+        if (event.event === "resume_assistant_audio") {
+          resumeTts();
         }
 
         if (event.event === "transcript_partial") {
@@ -375,9 +421,6 @@ export function useAgentSession() {
 
   const sendVoiceEvent = useCallback(
     async (event: VoiceEventInput) => {
-      if (event.event === "speech_started" || event.event === "interruption") {
-        flushTtsQueue();
-      }
       try {
         const outbound = await transport.send(event);
         handleOutboundVoiceEvents(outbound);

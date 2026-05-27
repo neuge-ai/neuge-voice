@@ -17,7 +17,7 @@ const CHANNELS = 1;
 const SPEECH_THRESHOLD = 0.035;
 const SPEECH_START_MS = 150;
 const SPEECH_END_MS = 700;
-const INTERRUPTION_MS = 250;
+
 
 export function useMicrophone(options: UseMicrophoneOptions = {}) {
   const [state, setState] = useState<MicState>("idle");
@@ -34,7 +34,7 @@ export function useMicrophone(options: UseMicrophoneOptions = {}) {
   const speechSegmentIdRef = useRef<string | null>(null);
   const aboveThresholdSinceRef = useRef<number | null>(null);
   const belowThresholdSinceRef = useRef<number | null>(null);
-  const interruptionSentRef = useRef(false);
+
   const onVoiceEventRef = useRef(options.onVoiceEvent);
 
   useEffect(() => {
@@ -50,7 +50,7 @@ export function useMicrophone(options: UseMicrophoneOptions = {}) {
       const speechSegmentId = crypto.randomUUID();
       speechSegmentIdRef.current = speechSegmentId;
       speakingRef.current = true;
-      interruptionSentRef.current = false;
+
       setVadState("speaking");
       emit({ event: "speech_started", metadata: { level: rms, speech_segment_id: speechSegmentId } });
     },
@@ -61,7 +61,7 @@ export function useMicrophone(options: UseMicrophoneOptions = {}) {
     (rms: number) => {
       const speechSegmentId = speechSegmentIdRef.current;
       speakingRef.current = false;
-      interruptionSentRef.current = false;
+
       speechSegmentIdRef.current = null;
       setVadState("silent");
       emit({ event: "speech_ended", metadata: { level: rms, speech_segment_id: speechSegmentId } });
@@ -84,7 +84,7 @@ export function useMicrophone(options: UseMicrophoneOptions = {}) {
     speechSegmentIdRef.current = null;
     aboveThresholdSinceRef.current = null;
     belowThresholdSinceRef.current = null;
-    interruptionSentRef.current = false;
+
     setVadState("silent");
     setLevel(0);
   }, []);
@@ -114,10 +114,7 @@ export function useMicrophone(options: UseMicrophoneOptions = {}) {
         beginSpeech(rms);
       }
 
-      if (speakingRef.current && !interruptionSentRef.current && now - aboveThresholdSinceRef.current >= INTERRUPTION_MS) {
-        interruptionSentRef.current = true;
-        emit({ event: "interruption", metadata: { level: rms, speech_segment_id: speechSegmentIdRef.current } });
-      }
+
     } else {
       aboveThresholdSinceRef.current = null;
       belowThresholdSinceRef.current ??= now;
