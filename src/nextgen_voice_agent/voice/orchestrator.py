@@ -178,6 +178,8 @@ class VoiceSessionState:
     active_utterance: UtteranceBuffer | None = None
     active_asr_stream: SttStream | None = None
     active_asr_mode: AsrMode = AsrMode.UTTERANCE_BATCH
+    playback_paused: bool = False
+    pause_resume_timer_expires_at: datetime | None = None
     last_transcript: str | None = None
     last_partial_transcript: str | None = None
     pending_transcript: str = ""
@@ -252,8 +254,11 @@ class VoiceSessionOrchestrator:
             state.user_speech_started_at = now
             state.candidate_speech_started_at = now
             state.candidate_speech_ended_at = None
+            state.pause_resume_timer_expires_at = None
             if state.assistant_speaking:
                 state.voice_state = VoiceTurnState.BARGE_IN_CANDIDATE
+                state.playback_paused = True
+                await self._emit(state, VoiceEventType.PAUSE_ASSISTANT_AUDIO, "Pausing assistant audio")
             else:
                 state.voice_state = VoiceTurnState.USER_SPEAKING
             segment_id = str(event.metadata.get("speech_segment_id") or f"{session_id}-{int(self.clock().timestamp() * 1000)}")
@@ -269,19 +274,13 @@ class VoiceSessionOrchestrator:
         if event.event == VoiceEventType.SPEECH_ENDED:
             state.user_speaking = False
             state.candidate_speech_ended_at = self.clock()
+            if state.playback_paused:
+                state.pause_resume_timer_expires_at = self.clock() + timedelta(milliseconds=self.timing.barge_in_min_speech_ms)
             await self._finalize_utterance(state)
             if state.voice_state == VoiceTurnState.USER_SPEAKING:
                 state.voice_state = VoiceTurnState.LISTENING
             elif state.voice_state == VoiceTurnState.BARGE_IN_CANDIDATE and state.assistant_speaking:
                 state.voice_state = VoiceTurnState.ASSISTANT_SPEAKING
-            return
-
-        if event.event == VoiceEventType.INTERRUPTION:
-            state.user_speaking = True
-            if state.assistant_speaking:
-                state.voice_state = VoiceTurnState.BARGE_IN_CANDIDATE
-                if self._candidate_speech_duration_ms(state) >= self.timing.barge_in_min_speech_ms:
-                    await self._stop_assistant_audio(state)
             return
 
         if event.event == VoiceEventType.ASSISTANT_SPEECH_STARTED:
@@ -297,6 +296,8 @@ class VoiceSessionOrchestrator:
         if event.event == VoiceEventType.ASSISTANT_SPEECH_ENDED:
             now = self.clock()
             state.assistant_speaking = False
+            state.playback_paused = False
+            state.pause_resume_timer_expires_at = None
             state.last_assistant_speech_at = now
             state.assistant_speech_ended_at = now
             self._mark_delivery_speech_ended(state, event.metadata)
@@ -721,7 +722,7 @@ class VoiceSessionOrchestrator:
         try:
             while not state.stopped:
                 await asyncio.sleep(interval)
-                self._advance_turn_state(state)
+                await self._advance_turn_state(state)
                 await self._maybe_commit_turn(state)
                 await self._poll_task_result(state)
                 await self._maybe_deliver_timer_alert(state)
@@ -1462,11 +1463,18 @@ class VoiceSessionOrchestrator:
     async def _stop_assistant_audio(self, state: VoiceSessionState) -> None:
         if state.assistant_speaking:
             state.assistant_speaking = False
+        state.playback_paused = False
+        state.pause_resume_timer_expires_at = None
         state.voice_state = VoiceTurnState.USER_SPEAKING if state.user_speaking else VoiceTurnState.LISTENING
         state.post_tts_cooldown_expires_at = None
         await self._emit(state, VoiceEventType.STOP_ASSISTANT_AUDIO, "Stopping assistant audio.")
 
-    def _advance_turn_state(self, state: VoiceSessionState) -> None:
+    async def _advance_turn_state(self, state: VoiceSessionState) -> None:
+        if state.pause_resume_timer_expires_at and self.clock() >= state.pause_resume_timer_expires_at:
+            state.playback_paused = False
+            state.pause_resume_timer_expires_at = None
+            await self._emit(state, VoiceEventType.RESUME_ASSISTANT_AUDIO, "Resuming assistant audio (false alarm)")
+
         if state.voice_state == VoiceTurnState.POST_TTS_COOLDOWN and state.post_tts_cooldown_expires_at:
             if self.clock() >= state.post_tts_cooldown_expires_at:
                 state.voice_state = VoiceTurnState.LISTENING
