@@ -105,15 +105,35 @@ export function ProductDashboard() {
 
           {/* Bottom Control Bar */}
           <div className="fixed bottom-10 left-0 right-0 z-50 flex justify-around md:justify-center md:space-x-12 items-center max-w-[340px] md:max-w-none mx-auto md:mx-0 px-8 py-4 md:static rounded-full glass-panel shadow-[0_8px_32px_rgba(0,0,0,0.5)] md:shadow-[0_8px_32px_rgba(0,0,0,0.3)] transition-all duration-300 hover:bg-white/[0.05] hover:border-white/20 w-full md:w-auto">
-            <button
-              onClick={mic.state === "listening" ? mic.stop : handleStartMic}
-              className={`flex flex-col items-center justify-center scale-110 group transition-all duration-300 ${mic.state === 'listening' ? 'text-secondary drop-shadow-[0_0_8px_rgba(76,215,246,0.5)]' : 'text-on-surface-variant opacity-80 hover:opacity-100 hover:text-primary hover:drop-shadow-[0_0_8px_rgba(208,188,255,0.5)]'}`}
-            >
-              <div className={`w-12 h-12 rounded-full flex items-center justify-center md:mb-1 transition-all duration-300 ${mic.state === 'listening' ? 'bg-secondary/10 group-hover:bg-secondary/20 border border-secondary/30 shadow-[0_0_15px_rgba(76,215,246,0.4)] group-hover:shadow-[0_0_25px_rgba(76,215,246,0.7)]' : 'bg-transparent group-hover:bg-primary/10 border border-transparent group-hover:border-primary/20 group-hover:shadow-[0_0_20px_rgba(208,188,255,0.4)]'}`}>
-                <span className="material-symbols-outlined transition-transform duration-300 group-hover:scale-110" style={{ fontVariationSettings: '"FILL" 1, "wght" 500, "GRAD" 0, "opsz" 24' }}>mic</span>
-              </div>
-              <span className="hidden md:block font-label-caps text-label-caps font-bold tracking-widest">{mic.state === 'listening' ? 'Listening' : 'Mic'}</span>
-            </button>
+            {mic.permissionState !== 'granted' ? (
+              <button
+                onClick={handleStartMic}
+                className="flex flex-col items-center justify-center text-error group relative"
+              >
+                {/* Tooltip */}
+                <div className="absolute -top-12 left-1/2 -translate-x-1/2 px-3 py-1 bg-error/90 backdrop-blur-md rounded-lg text-[10px] font-label-caps text-white opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap shadow-xl border border-white/10 z-50">
+                    Permission Required
+                </div>
+                <div className="relative">
+                  <div className="w-12 h-12 rounded-full bg-error/10 flex items-center justify-center mb-1 transition-all duration-300 border border-error/30 shadow-[0_0_15px_rgba(255,180,171,0.2)] backdrop-blur-md">
+                    <span className="material-symbols-outlined text-error transition-transform duration-300" style={{ fontVariationSettings: '"FILL" 0' }}>mic_off</span>
+                  </div>
+                  {/* Warning Badge */}
+                  <div className="absolute -top-0.5 -right-0.5 w-3 h-3 bg-error rounded-full border-2 border-surface shadow-[0_0_8px_rgba(255,180,171,0.8)] z-10"></div>
+                </div>
+                <span className="font-label-caps text-label-caps text-error font-bold tracking-widest">Mic Off</span>
+              </button>
+            ) : (
+              <button
+                onClick={mic.state === "listening" ? mic.stop : handleStartMic}
+                className={`flex flex-col items-center justify-center scale-110 group transition-all duration-300 ${mic.state === 'listening' ? 'text-secondary drop-shadow-[0_0_8px_rgba(76,215,246,0.5)]' : 'text-on-surface-variant opacity-80 hover:opacity-100 hover:text-primary hover:drop-shadow-[0_0_8px_rgba(208,188,255,0.5)]'}`}
+              >
+                <div className={`w-12 h-12 rounded-full flex items-center justify-center md:mb-1 transition-all duration-300 ${mic.state === 'listening' ? 'bg-secondary/10 group-hover:bg-secondary/20 border border-secondary/30 shadow-[0_0_15px_rgba(76,215,246,0.4)] group-hover:shadow-[0_0_25px_rgba(76,215,246,0.7)]' : 'bg-transparent group-hover:bg-primary/10 border border-transparent group-hover:border-primary/20 group-hover:shadow-[0_0_20px_rgba(208,188,255,0.4)]'}`}>
+                  <span className="material-symbols-outlined transition-transform duration-300 group-hover:scale-110" style={{ fontVariationSettings: '"FILL" 1, "wght" 500, "GRAD" 0, "opsz" 24' }}>mic</span>
+                </div>
+                <span className="hidden md:block font-label-caps text-label-caps font-bold tracking-widest">{mic.state === 'listening' ? 'Listening' : 'Mic'}</span>
+              </button>
+            )}
 
             <button
               onClick={handleStopSpeech}
