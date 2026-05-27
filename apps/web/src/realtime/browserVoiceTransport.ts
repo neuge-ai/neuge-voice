@@ -29,6 +29,7 @@ export type BrowserVoiceEvent = {
   audio_ref?: string;
   task_id?: string;
   metadata?: Record<string, unknown>;
+  created_at: string;
 };
 
 export type VoiceEventInput = Omit<BrowserVoiceEvent, "transport" | "session_id">;

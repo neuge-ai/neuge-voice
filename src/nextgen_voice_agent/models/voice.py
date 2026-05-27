@@ -5,6 +5,9 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from nextgen_voice_agent.models.task import utc_now
+from datetime import datetime
+
 
 class VoiceTransportKind(StrEnum):
     BROWSER = "browser"
@@ -47,3 +50,4 @@ class VoiceEvent(BaseModel):
     audio_ref: str | None = None
     task_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utc_now)
