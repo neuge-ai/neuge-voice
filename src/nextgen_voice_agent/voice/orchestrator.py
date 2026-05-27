@@ -137,6 +137,16 @@ class AsrTurnCandidate:
     reason: str = "unknown"
 
 
+def format_ms_to_human(ms: int | None) -> str | None:
+    if ms is None:
+        return None
+    total_seconds = max(0, ms) // 1000
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    return f"{days} Days {hours} hours {minutes} minutes and {seconds} seconds"
+
+
 @dataclass
 class VoiceSessionState:
     session_id: str
@@ -1144,7 +1154,9 @@ class VoiceSessionOrchestrator:
             "started_at": timer.started_at.astimezone().isoformat(),
             "ends_at": timer.ends_at.astimezone().isoformat(),
             "elapsed_ms": elapsed_ms,
+            "elapsed_time_human": format_ms_to_human(elapsed_ms),
             "remaining_ms": remaining_ms,
+            "remaining_time_human": format_ms_to_human(remaining_ms),
             "status": timer.status,
             "reason": timer.reason,
         }
@@ -1157,6 +1169,7 @@ class VoiceSessionOrchestrator:
             "label": activity.label,
             "started_at": activity.started_at.astimezone().isoformat(),
             "elapsed_ms": elapsed_ms,
+            "elapsed_time_human": format_ms_to_human(elapsed_ms),
             "target_duration_ms": activity.target_duration_ms,
             "target_distance_meters": activity.target_distance_meters,
             "status": activity.status,
