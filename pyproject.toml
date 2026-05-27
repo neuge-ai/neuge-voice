@@ -13,6 +13,7 @@ dependencies = [
   "elevenlabs>=1.0.2",
   "litellm>=1.0.0",
   "sarvamai>=0.1.0",
+  "numpy>=2.4.6",
 ]
 
 [project.optional-dependencies]
