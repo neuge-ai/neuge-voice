@@ -1,24 +1,40 @@
 import React from "react";
 
 export function VoiceOrb({ isSpeaking, isListening, isUserSpeaking, userAudioLevel }: { isSpeaking: boolean; isListening: boolean; isUserSpeaking: boolean; userAudioLevel: number }) {
-  let stateClass = 'state-idle';
+  let state = 'idle';
   if (isSpeaking) {
-    stateClass = 'state-speaking-ai';
+    state = 'ai-speaking';
   } else if (isUserSpeaking) {
-    stateClass = 'state-speaking-user';
+    state = 'user-speaking';
   } else if (isListening) {
-    stateClass = 'state-listening';
+    state = 'listening';
   }
 
   return (
-    <div className={`voice-orb ${stateClass} w-[40vmin] h-[40vmin] max-w-[280px] max-h-[280px] md:max-w-[480px] md:max-h-[480px] rounded-full relative flex items-center justify-center transition-transform duration-700 hover:scale-[1.03]`}>
-      <div className="orb-core absolute w-[60%] h-[60%] rounded-full blur-xl mix-blend-screen"></div>
-      <div className="absolute w-[80%] h-[80%] rounded-full bg-gradient-to-b from-transparent to-black/20 blur-2xl"></div>
+    <div className="relative w-80 h-80 transition-all duration-500 ease-in-out">
+      {/* Outer Glow/Pulse Layer */}
+      <div 
+        className={`absolute inset-0 rounded-full opacity-80 blur-[2px] transition-all duration-500 ${
+          state === 'idle' ? 'bg-gradient-to-br from-primary via-[#b39ddb] to-primaryContainer animate-orb-glow' :
+          state === 'ai-speaking' ? 'bg-gradient-to-br from-primary via-[#b39ddb] to-primaryContainer animate-orb-glow-intense' :
+          state === 'listening' ? 'bg-cyanCore/20 animate-sonar-pulse' :
+          'bg-cyanCore/40 animate-erratic-vibe'
+        }`} 
+      />
       
-      <div className="absolute inset-0 rounded-full border border-white/5"></div>
+      {/* Overlays */}
+      <div className="absolute inset-0 bg-gradient-to-tr from-white/40 to-transparent rounded-full mix-blend-overlay"></div>
+      <div className="absolute inset-2 bg-gradient-to-bl from-black/20 to-transparent rounded-full mix-blend-multiply"></div>
       
-      <div className="inner-ripple-1 absolute inset-[-10%] rounded-full border opacity-0 mix-blend-screen"></div>
-      <div className="inner-ripple-2 absolute inset-[-20%] rounded-full border opacity-0 mix-blend-screen"></div>
+      {/* Inner glowing core */}
+      <div 
+        className={`absolute inset-0 m-auto w-3/4 h-3/4 rounded-full blur-xl opacity-60 transition-all duration-500 ${
+          state === 'idle' ? 'bg-primary animate-pulse-slow' :
+          state === 'ai-speaking' ? 'bg-primary animate-ai-speech-pulse' :
+          state === 'listening' ? 'bg-cyanCore animate-pulse-slow' :
+          'bg-cyanCore animate-erratic-vibe'
+        }`} 
+      />
     </div>
   );
 }

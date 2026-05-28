@@ -1,5 +1,6 @@
 import { type AgentEvent } from "../../api/agentApi";
 import { useActiveTools } from "../../hooks/useActiveTools";
+import { Link } from "react-router-dom";
 
 export function SideNav({ events = [], isOpen = false, onClose = () => {} }: { events?: AgentEvent[], isOpen?: boolean, onClose?: () => void }) {
   const { activeTools } = useActiveTools();
@@ -13,71 +14,77 @@ export function SideNav({ events = [], isOpen = false, onClose = () => {} }: { e
   };
 
   return (
-    <nav className={`fixed inset-0 md:inset-auto md:left-0 md:top-0 h-full w-full md:w-[320px] flex flex-col transition-transform duration-300 md:translate-x-0 z-[70] md:z-40 ${isOpen ? 'translate-x-0' : '-translate-x-full'} glass-panel max-md:!bg-surface-dim/80 max-md:!backdrop-blur-3xl shadow-[8px_0_32px_rgba(0,0,0,0.3)] md:shadow-2xl border-y-0 border-l-0`}>
+    <aside className={`w-80 h-full flex flex-col border-r border-outlineVariant/30 bg-surface/80 backdrop-blur-sm z-10 fixed md:relative left-0 top-0 transition-transform duration-300 md:translate-x-0 ${isOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}`}>
       
-      {/* Mobile-only Header */}
-      <div className="flex md:hidden justify-between items-center p-6 pt-12 glass-panel border-x-0 border-t-0 rounded-none shadow-none mb-4">
-        <h2 className="text-[14px] font-label-caps text-primary tracking-[0.2em] uppercase font-bold">ACTIVE TOOLS</h2>
-        <button 
-          className="text-on-surface-variant hover:text-white p-2 rounded-full hover:bg-white/5 transition-colors" 
-          onClick={onClose}
-        >
+      {/* Header */}
+      <div className="p-6 flex justify-between items-center">
+        <h1 className="text-xl font-bold font-feature-title text-onSurface">NextGen Voice</h1>
+        <button className="md:hidden text-onSurfaceVariant hover:text-white p-2 rounded-full hover:bg-white/5 transition-colors" onClick={onClose}>
           <span className="material-symbols-outlined">close</span>
         </button>
       </div>
 
-      {/* Desktop-only Title */}
-      <div className="hidden md:block font-headline-md text-headline-md tracking-[0.15em] mt-8 mb-6 font-semibold bg-gradient-to-r from-white to-slate-200 bg-clip-text text-transparent uppercase pl-8">NextGen Voice</div>
-      
-      <div className="flex flex-col gap-4 flex-grow px-6">
-        <a className="glass-elevated p-4 rounded-xl flex items-center gap-4 transition-all group hover:bg-white/[0.05]" href="#">
-          <div className="w-10 h-10 rounded-full glass-recessed flex items-center justify-center text-primary group-hover:text-primary-fixed transition-colors">
-            <span className="material-symbols-outlined text-[20px]" style={{ fontVariationSettings: '"FILL" 1' }}>analytics</span>
+      {/* Navigation */}
+      <nav className="px-4 py-2">
+        <div className="glass-panel rounded-xl p-3 flex items-center gap-4 cursor-pointer hover:bg-surfaceContainerHigh transition-colors group">
+          <div className="w-8 h-8 rounded-lg bg-surfaceContainerHighest flex items-center justify-center text-primary group-hover:bg-primary group-hover:text-onPrimary transition-colors">
+            <svg fill="none" height="16" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 24 24" width="16" xmlns="http://www.w3.org/2000/svg"><path d="M3 3v18h18"></path><path d="M18 17V9"></path><path d="M13 17V5"></path><path d="M8 17v-3"></path></svg>
           </div>
           <div>
-            <div className="font-body-md text-body-md text-white font-semibold">Overview</div>
-            <div className="font-metadata-sm text-[10px] text-slate-300 uppercase tracking-[0.15em] font-mono mt-1">Dashboard Active</div>
+            <div className="font-bold text-onSurface">Overview</div>
+            <div className="font-label-sm text-label-sm text-onSurfaceVariant mt-0.5">Dashboard Active</div>
           </div>
-        </a>
-      </div>
+        </div>
+      </nav>
 
-      <div className="mt-auto mb-6 flex flex-col gap-3 z-10 relative px-6">
-        <div className="font-label-caps text-label-caps text-slate-200 font-bold tracking-[0.2em] uppercase mb-4 px-2">Active Tools</div>
-        
-        <div className="flex flex-col gap-3">
+      {/* Active Tools */}
+      <div className="flex-1 px-4 py-6 overflow-y-auto mt-8">
+        <h2 className="font-label-sm text-label-sm text-onSurfaceVariant mb-4 px-2">Active Tools</h2>
+        <div className="space-y-3">
           {activeTools.length === 0 ? (
-             <div className="text-slate-300 text-sm italic px-2">No active tools...</div>
+            <div className="text-onSurfaceVariant text-sm italic px-2">No active tools...</div>
           ) : (
             activeTools.map((tool) => (
-              <div key={tool.id} className="glass-recessed p-4 rounded-xl flex items-center justify-between group hover:bg-white/[0.02] transition-all border border-white/5">
-                <div className="flex items-center gap-4">
-                  <div className="w-8 h-8 rounded-full flex items-center justify-center text-slate-200 group-hover:text-secondary transition-colors">
-                    <span className="material-symbols-outlined text-[18px]">
-                      {tool.type === 'timer' ? 'timer' : tool.type === 'activity' ? 'directions_run' : 'routine'}
-                    </span>
+              <div key={tool.id} className="glass-panel rounded-xl p-4 hover:bg-surfaceContainer transition-colors cursor-pointer group">
+                <div className="flex items-start justify-between mb-2">
+                  <div className="flex items-center gap-3">
+                    <svg className="text-onSurfaceVariant group-hover:text-primary transition-colors" fill="none" height="16" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 24 24" width="16" xmlns="http://www.w3.org/2000/svg"><path d="M12 20v-6M6 20V10M18 20V4"></path></svg>
+                    <span className="font-bold text-onSurface truncate max-w-[140px]">{tool.title || "Background Task"}</span>
                   </div>
-                  <div>
-                    <div className="font-body-md text-sm text-white font-semibold tracking-wide truncate max-w-[140px]" title={tool.title || "Background Task"}>{tool.title || "Background Task"}</div>
-                    <div className="font-metadata-sm text-[10px] text-slate-300 mt-0.5 uppercase tracking-wider">{tool.type}</div>
-                  </div>
+                  <span className="text-xs text-secondary font-mono">{formatElapsed(tool.elapsed_ms)}</span>
                 </div>
-                <div className="text-secondary font-mono text-[10px] font-bold pl-2 tracking-widest">{formatElapsed(tool.elapsed_ms)}</div>
+                <div className="mt-3 text-xs text-onSurfaceVariant flex items-center justify-between">
+                  <div className="flex items-center gap-1.5 text-primary">
+                    <span className="relative flex h-2 w-2">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-primary opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-2 w-2 bg-primary"></span>
+                    </span>
+                    <span className="font-label-sm text-label-sm">ACTIVE</span>
+                  </div>
+                  <span className="font-label-sm text-label-sm text-onSurfaceVariant uppercase">{tool.type}</span>
+                </div>
               </div>
             ))
           )}
         </div>
       </div>
 
-      <div className="flex md:flex-row flex-col gap-4 md:gap-6 mt-2 pt-6 pb-8 md:pb-8 border-t border-white/10 md:border-0 z-10 relative px-6">
-        <a className="flex items-center space-x-3 text-slate-300 hover:text-white transition-colors w-full md:w-auto p-3 md:p-0 rounded-lg hover:bg-white/5 md:hover:bg-transparent group" href="#">
-          <span className="material-symbols-outlined text-[16px]">help</span>
-          <span className="font-label-caps text-[10px] md:text-label-caps tracking-widest uppercase font-bold">Help</span>
-        </a>
-        <a className="flex items-center space-x-3 text-slate-300 hover:text-white transition-colors w-full md:w-auto p-3 md:p-0 rounded-lg hover:bg-white/5 md:hover:bg-transparent group" href="#">
-          <span className="material-symbols-outlined text-[16px]">rate_review</span>
-          <span className="font-label-caps text-[10px] md:text-label-caps tracking-widest uppercase font-bold">Feedback</span>
-        </a>
+      {/* Footer Settings */}
+      <div className="p-6 border-t border-outlineVariant/30 flex justify-between items-center text-onSurfaceVariant">
+        <Link to="/settings" className="flex-1 flex items-center gap-2 px-3 py-2 -ml-3 mr-2 rounded-lg hover:bg-white/5 hover:text-onSurface transition-colors font-label-sm text-label-sm">
+          <svg fill="none" height="16" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 24 24" width="16" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+          Settings
+        </Link>
+        
+        <div className="flex items-center gap-1 -mr-2">
+          <button className="p-2 rounded-lg hover:bg-white/5 hover:text-onSurface transition-colors flex items-center justify-center" title="Help">
+            <svg fill="none" height="16" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 24 24" width="16" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="10"></circle><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"></path><path d="M12 17h.01"></path></svg>
+          </button>
+          <button className="p-2 rounded-lg hover:bg-white/5 hover:text-onSurface transition-colors flex items-center justify-center" title="Feedback">
+            <svg fill="none" height="16" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 24 24" width="16" xmlns="http://www.w3.org/2000/svg"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+          </button>
+        </div>
       </div>
-    </nav>
+    </aside>
   );
 }
