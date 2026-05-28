@@ -22,7 +22,14 @@ from nextgen_voice_agent.server.realtime import build_realtime_session_config, c
 from nextgen_voice_agent.voice.orchestrator import VoiceSessionOrchestrator
 from nextgen_voice_agent.voice.tts import TtsProvider, TtsProviderError, TtsRequest, TtsResult
 
+from . import codex_cli
+
 router = APIRouter()
+
+class AddMcpToolRequest(BaseModel):
+    name: str
+    command: str
+    args: list[str]
 
 
 class ApprovalRequest(BaseModel):
@@ -293,6 +300,31 @@ async def get_active_tools(
                 })
                 
     return {"tools": tools}
+
+
+@router.get("/api/codex/mcp-tools")
+async def fetch_mcp_tools() -> dict[str, object]:
+    try:
+        tools = await codex_cli.get_mcp_tools()
+        return {"servers": tools}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/api/codex/mcp-tools")
+async def create_mcp_tool(request: AddMcpToolRequest) -> dict[str, object]:
+    try:
+        await codex_cli.add_mcp_tool(request.name, request.command, request.args)
+        return {"success": True, "message": f"MCP tool '{request.name}' added."}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@router.delete("/api/codex/mcp-tools/{tool_name}")
+async def delete_mcp_tool(tool_name: str) -> dict[str, object]:
+    try:
+        await codex_cli.remove_mcp_tool(tool_name)
+        return {"success": True, "message": f"MCP tool '{tool_name}' removed."}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 webrtc_manager = None
 
