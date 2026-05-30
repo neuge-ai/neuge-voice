@@ -79,3 +79,12 @@ def get_settings() -> Settings:
     valid_keys = Settings.model_fields.keys()
     filtered_data = {k: v for k, v in toml_data.items() if k in valid_keys and v != "default"}
     return Settings(**filtered_data)
+
+def inject_llm_secrets() -> None:
+    groq_key = get_secret("groq_api_key")
+    if groq_key:
+        os.environ["GROQ_API_KEY"] = groq_key
+        
+    openai_key = get_secret("openai_api_key")
+    if openai_key:
+        os.environ["OPENAI_API_KEY"] = openai_key

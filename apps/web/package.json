@@ -1,9 +1,9 @@
 {
-  "name": "nextgen-voice-agent-web",
-  "version": "0.1.0",
+  "name": "neuge-voice",
+  "version": "0.8.2",
   "private": true,
-  "author": "NextGen <dev@nextgenvoice.com>",
-  "homepage": "https://github.com/nextgenvoice",
+  "author": "Soumyajit Basu <soumyajit.basu22@gmail.com>",
+  "homepage": "https://github.com/neuge-ai/neuge-voice",
   "type": "module",
   "main": "main.cjs",
   "scripts": {
@@ -14,8 +14,14 @@
     "electron:build": "npm run build && electron-builder"
   },
   "build": {
-    "appId": "com.nextgen.voiceagent",
-    "productName": "NextGen Voice Agent",
+    "appId": "com.neugeai.voice",
+    "productName": "Neuge Voice",
+    "mac": {
+      "target": ["dmg", "zip"],
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Neuge Voice needs microphone access to listen to your voice commands."
+      }
+    },
     "directories": {
       "output": "release"
     },
