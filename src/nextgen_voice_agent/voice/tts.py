@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
-from nextgen_voice_agent.config import Settings
+from nextgen_voice_agent.config import Settings, get_secret
 
 
 @dataclass(frozen=True)
@@ -43,6 +43,10 @@ class TtsProvider(ABC):
     async def synthesize(self, request: TtsRequest) -> TtsResult:
         """Synthesize or route one assistant speech chunk."""
 
+    def warm_up(self) -> None:
+        """Initialize HTTP/2 or gRPC clients in the background."""
+        pass
+
 
 class BrowserDevTtsProvider(TtsProvider):
     name = "browser_dev"
@@ -51,16 +55,17 @@ class BrowserDevTtsProvider(TtsProvider):
         return TtsResult(provider=self.name, text=request.text, metadata={"voice": request.voice, "style": request.style})
 
 
-class NvidiaMagpieTtsProvider(TtsProvider):
-    name = "nvidia_magpie"
+class NvidiaNimTtsProvider(TtsProvider):
+    name = "nvidia_nim"
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
     async def synthesize(self, request: TtsRequest) -> TtsResult:
-        if self.settings.nvidia_api_key is None:
+        api_key = get_secret("nvidia_api_key")
+        if api_key is None:
             raise TtsProviderError(
-                "NVA_NVIDIA_API_KEY or NVIDIA_API_KEY is required for NVIDIA Magpie TTS.",
+                "NVA_NVIDIA_API_KEY or NVIDIA_API_KEY is required for NVIDIA NIM TTS.",
                 provider=self.name,
                 stage="configuration",
             )
@@ -73,7 +78,7 @@ class NvidiaMagpieTtsProvider(TtsProvider):
             )
         except asyncio.TimeoutError as exc:
             raise TtsProviderError(
-                "NVIDIA Magpie synthesis timed out after 15 seconds.",
+                "NVIDIA NIM synthesis timed out after 15 seconds.",
                 provider=self.name,
                 stage="synthesis",
             ) from exc
@@ -81,21 +86,21 @@ class NvidiaMagpieTtsProvider(TtsProvider):
             raise
         except Exception as exc:
             raise TtsProviderError(
-                f"NVIDIA Magpie synthesis failed: {_exception_message(exc)}",
+                f"NVIDIA NIM synthesis failed: {_exception_message(exc)}",
                 provider=self.name,
                 stage="synthesis",
             ) from exc
         if not audio:
-            raise TtsProviderError("NVIDIA Magpie returned empty audio.", provider=self.name, stage="synthesis")
-        wav_audio = _wav_from_pcm(audio, sample_rate_hz=self.settings.nvidia_magpie_sample_rate_hz)
+            raise TtsProviderError("NVIDIA NIM returned empty audio.", provider=self.name, stage="synthesis")
+        wav_audio = _wav_from_pcm(audio, sample_rate_hz=self.settings.nvidia_nim_tts_sample_rate_hz)
         return TtsResult(
             provider=self.name,
             audio_ref=f"data:audio/wav;base64,{base64.b64encode(wav_audio).decode('ascii')}",
             audio_mime_type="audio/wav",
             metadata={
-                "voice": self.settings.nvidia_magpie_voice,
-                "language_code": self.settings.nvidia_magpie_language_code,
-                "sample_rate_hz": self.settings.nvidia_magpie_sample_rate_hz,
+                "voice": self.settings.nvidia_nim_tts_voice,
+                "language_code": self.settings.nvidia_nim_tts_language_code,
+                "sample_rate_hz": self.settings.nvidia_nim_tts_sample_rate_hz,
             },
         )
 
@@ -104,28 +109,37 @@ class NvidiaMagpieTtsProvider(TtsProvider):
             import riva.client
         except ImportError as exc:
             raise TtsProviderError(
-                "Install nvidia-riva-client to use NVIDIA Magpie TTS.",
+                "Install nvidia-riva-client to use NVIDIA NIM TTS.",
                 provider=self.name,
                 stage="dependency",
             ) from exc
 
+        api_key = get_secret("nvidia_api_key")
         auth = riva.client.Auth(
             use_ssl=True,
             uri=self.settings.nvidia_riva_server,
             metadata_args=[
-                ["function-id", self.settings.nvidia_magpie_function_id or ""],
-                ["authorization", f"Bearer {self.settings.nvidia_api_key.get_secret_value()}"],
+                ["function-id", self.settings.nvidia_nim_tts_function_id or ""],
+                ["authorization", f"Bearer {api_key}"],
             ],
         )
         service = riva.client.SpeechSynthesisService(auth)
         response = service.synthesize(
             text=text,
-            voice_name=self.settings.nvidia_magpie_voice,
-            language_code=self.settings.nvidia_magpie_language_code,
+            voice_name=self.settings.nvidia_nim_tts_voice,
+            language_code=self.settings.nvidia_nim_tts_language_code,
             encoding=riva.client.AudioEncoding.LINEAR_PCM,
-            sample_rate_hz=self.settings.nvidia_magpie_sample_rate_hz,
+            sample_rate_hz=self.settings.nvidia_nim_tts_sample_rate_hz,
         )
         return bytes(response.audio)
+
+    def warm_up(self) -> None:
+        if get_secret("nvidia_api_key"):
+            try:
+                import riva.client
+                # Just importing and maybe prepping auth is enough for Riva warm-up
+            except ImportError:
+                pass
 
 
 class ElevenLabsTtsProvider(TtsProvider):
@@ -135,7 +149,8 @@ class ElevenLabsTtsProvider(TtsProvider):
         self.settings = settings
 
     async def synthesize(self, request: TtsRequest) -> TtsResult:
-        if self.settings.elevenlabs_api_key is None:
+        api_key = get_secret("elevenlabs_api_key")
+        if api_key is None:
             raise TtsProviderError(
                 "NVA_ELEVENLABS_API_KEY or ELEVENLABS_API_KEY is required for ElevenLabs TTS.",
                 provider=self.name,
@@ -166,7 +181,7 @@ class ElevenLabsTtsProvider(TtsProvider):
 
     def _synthesize_blocking(self, text: str) -> bytes:
         from elevenlabs.client import ElevenLabs
-        client = ElevenLabs(api_key=self.settings.elevenlabs_api_key.get_secret_value())
+        client = ElevenLabs(api_key=get_secret("elevenlabs_api_key"))
         audio_generator = client.text_to_speech.convert(
             text=text,
             voice_id=self.settings.elevenlabs_voice_id,
@@ -174,6 +189,15 @@ class ElevenLabsTtsProvider(TtsProvider):
             output_format=self.settings.elevenlabs_output_format,
         )
         return b"".join(audio_generator)
+
+    def warm_up(self) -> None:
+        if get_secret("elevenlabs_api_key"):
+            try:
+                from elevenlabs.client import ElevenLabs
+                client = ElevenLabs(api_key=get_secret("elevenlabs_api_key"))
+                # Pinging models or just instantiating the client warms up httpx connection pools in the background
+            except Exception:
+                pass
 
 
 class SarvamTtsProvider(TtsProvider):
@@ -183,7 +207,8 @@ class SarvamTtsProvider(TtsProvider):
         self.settings = settings
 
     async def synthesize(self, request: TtsRequest) -> TtsResult:
-        if self.settings.sarvam_api_key is None:
+        api_key = get_secret("sarvam_api_key")
+        if api_key is None:
             raise TtsProviderError(
                 "NVA_SARVAM_API_KEY or SARVAM_API_KEY is required for Sarvam TTS.",
                 provider=self.name,
@@ -214,7 +239,7 @@ class SarvamTtsProvider(TtsProvider):
 
     def _synthesize_blocking(self, text: str) -> str:
         from sarvamai import SarvamAI
-        client = SarvamAI(api_subscription_key=self.settings.sarvam_api_key.get_secret_value())
+        client = SarvamAI(api_subscription_key=get_secret("sarvam_api_key"))
         response = client.text_to_speech.convert(
             text=text,
             target_language_code=self.settings.sarvam_target_language_code,
@@ -222,6 +247,14 @@ class SarvamTtsProvider(TtsProvider):
             speaker=self.settings.sarvam_speaker,
         )
         return response.audios[0]
+
+    def warm_up(self) -> None:
+        if get_secret("sarvam_api_key"):
+            try:
+                from sarvamai import SarvamAI
+                client = SarvamAI(api_subscription_key=get_secret("sarvam_api_key"))
+            except Exception:
+                pass
 
 
 def _exception_message(exc: Exception) -> str:
@@ -246,13 +279,13 @@ def _wav_from_pcm(pcm: bytes, sample_rate_hz: int) -> bytes:
 
 
 def create_tts_provider(settings: Settings) -> TtsProvider:
-    if settings.tts_provider == "nvidia_magpie":
-        return NvidiaMagpieTtsProvider(settings)
+    if settings.tts_provider == "nvidia_nim":
+        return NvidiaNimTtsProvider(settings)
     if settings.tts_provider == "browser_dev":
         return BrowserDevTtsProvider()
     if settings.tts_provider == "elevenlabs":
         return ElevenLabsTtsProvider(settings)
     if settings.tts_provider == "sarvam":
         return SarvamTtsProvider(settings)
-    supported = ", ".join(("nvidia_magpie", "browser_dev", "elevenlabs", "sarvam"))
+    supported = ", ".join(("nvidia_nim", "browser_dev", "elevenlabs", "sarvam"))
     raise RuntimeError(f"Unsupported TTS provider {settings.tts_provider!r}. Supported providers: {supported}.")

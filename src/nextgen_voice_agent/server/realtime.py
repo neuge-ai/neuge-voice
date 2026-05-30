@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from nextgen_voice_agent.config import Settings
+from nextgen_voice_agent.config import Settings, get_secret
 from nextgen_voice_agent.models.realtime import RealtimeSessionConfig, RealtimeTool
 from nextgen_voice_agent.voice.llm_router import SANITY_CHECK_INSTRUCTIONS
 
@@ -243,12 +243,12 @@ def build_openai_client_secret_payload(config: RealtimeSessionConfig) -> dict[st
 
 
 async def create_openai_realtime_client_secret(settings: Settings) -> dict[str, Any]:
-    if settings.openai_api_key is None:
+    api_key = get_secret("openai_api_key")
+    if api_key is None:
         raise RuntimeError("NVA_OPENAI_API_KEY is required to mint a Realtime client secret.")
 
     config = build_realtime_session_config(settings)
     payload = json.dumps(build_openai_client_secret_payload(config)).encode("utf-8")
-    api_key = settings.openai_api_key.get_secret_value()
 
     def request_client_secret() -> dict[str, Any]:
         request = urllib.request.Request(

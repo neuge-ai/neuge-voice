@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from nextgen_voice_agent.agent.controller import AgentController, TaskConflictError, TaskNotFoundError
 from nextgen_voice_agent.models.runtime import RuntimeResult
 from nextgen_voice_agent.models.realtime import RealtimeSessionConfig
+from typing import Any
 from nextgen_voice_agent.models.task import (
     AmendTaskRequest,
     CancelTaskRequest,
@@ -344,3 +345,32 @@ async def webrtc_offer(
         offer_type=request.type
     )
     return {"sdp": answer.sdp, "type": answer.type}
+
+from fastapi import Request
+
+@router.get("/api/settings")
+async def get_settings_api() -> dict[str, Any]:
+    from nextgen_voice_agent.config import load_toml_config
+    return load_toml_config()
+
+@router.post("/api/settings")
+async def update_settings_api(payload: dict[str, Any]) -> dict[str, str]:
+    from nextgen_voice_agent.config import load_toml_config, save_toml_config
+    current = load_toml_config()
+    current.update(payload)
+    save_toml_config(current)
+    return {"status": "ok"}
+
+@router.post("/api/settings/secrets")
+async def update_settings_secrets(request: Request, payload: dict[str, str | None]) -> dict[str, str]:
+    from nextgen_voice_agent.config import set_secret
+    for key, value in payload.items():
+        if value is not None:
+            set_secret(key, value)
+            
+    if hasattr(request.app.state, "stt_provider"):
+        request.app.state.stt_provider.warm_up()
+    if hasattr(request.app.state, "tts_provider"):
+        request.app.state.tts_provider.warm_up()
+        
+    return {"status": "ok"}

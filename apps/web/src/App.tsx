@@ -81,7 +81,7 @@ export function App() {
     <main className="app-shell">
       <header className="topbar">
         <div>
-          <h1>NextGen Voice Agent</h1>
+          <h1>Neuge Voice Agent</h1>
           <p>Basic browser voice surface for the Python agent backend.</p>
         </div>
         <div className="status-strip">
