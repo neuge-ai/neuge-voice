@@ -72,7 +72,7 @@ export function ProductDashboard() {
         <button className="text-onSurfaceVariant hover:text-white transition-colors p-2 rounded-full" onClick={() => setIsNavOpen(true)}>
           <span className="material-symbols-outlined" style={{ fontVariationSettings: '"FILL" 0' }}>menu</span>
         </button>
-        <h1 className="font-feature-title text-[16px] font-bold text-onSurface">NextGen Voice</h1>
+        <h1 className="font-feature-title text-[16px] font-bold text-onSurface">Neuge</h1>
         <button className="text-onSurfaceVariant hover:text-white transition-colors p-2 rounded-full" onClick={toggleLog}>
           <span className="material-symbols-outlined" style={{ fontVariationSettings: '"FILL" 0' }}>history</span>
         </button>

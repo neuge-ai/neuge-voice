@@ -18,7 +18,7 @@ export function SideNav({ events = [], isOpen = false, onClose = () => {} }: { e
       
       {/* Header */}
       <div className="p-6 flex justify-between items-center">
-        <h1 className="text-xl font-bold font-feature-title text-onSurface">NextGen Voice</h1>
+        <h1 className="text-xl font-bold font-feature-title text-onSurface">Neuge</h1>
         <button className="md:hidden text-onSurfaceVariant hover:text-white p-2 rounded-full hover:bg-white/5 transition-colors" onClick={onClose}>
           <span className="material-symbols-outlined">close</span>
         </button>

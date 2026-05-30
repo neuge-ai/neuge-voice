@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from nextgen_voice_agent.config import Settings
+from nextgen_voice_agent.config import Settings, get_secret
 
 
 @dataclass(frozen=True)
@@ -78,6 +78,10 @@ class SttProvider(ABC):
 
     async def start_stream(self, segment_id: str) -> SttStream:
         raise NotImplementedError(f"{self.name} does not support streaming ASR.")
+
+    def warm_up(self) -> None:
+        """Initialize HTTP/2 or gRPC clients in the background."""
+        pass
 
 
 class FakeSttStream(SttStream):
@@ -153,8 +157,8 @@ class FakeSttProvider(SttProvider):
         return FakeSttStream(segment_id=segment_id, transcript=self.transcript, provider=self.name)
 
 
-class NvidiaParakeetSttProvider(SttProvider):
-    name = "nvidia_parakeet"
+class NvidiaNimSttProvider(SttProvider):
+    name = "nvidia_nim"
     supports_streaming = True
 
     def __init__(self, settings: Settings) -> None:
@@ -177,27 +181,35 @@ class NvidiaParakeetSttProvider(SttProvider):
         )
 
     async def start_stream(self, segment_id: str) -> SttStream:
-        return NvidiaParakeetSttStream(segment_id=segment_id, provider=self.name, service=self._asr_service())
+        return NvidiaNimSttStream(segment_id=segment_id, provider=self.name, service=self._asr_service())
+
+    def warm_up(self) -> None:
+        if get_secret("nvidia_api_key"):
+            try:
+                self._asr_service()
+            except Exception:
+                pass
 
     def _asr_service(self):
         try:
             import riva.client
         except ImportError as exc:
-            raise RuntimeError("Install nvidia-riva-client to use NVIDIA Parakeet STT.") from exc
-        if self.settings.nvidia_api_key is None:
-            raise RuntimeError("NVA_NVIDIA_API_KEY or NVIDIA_API_KEY is required for NVIDIA Parakeet STT.")
+            raise RuntimeError("Install nvidia-riva-client to use NVIDIA NIM STT.") from exc
+        api_key = get_secret("nvidia_api_key")
+        if api_key is None:
+            raise RuntimeError("NVA_NVIDIA_API_KEY or NVIDIA_API_KEY is required for NVIDIA NIM STT.")
         auth = riva.client.Auth(
             use_ssl=True,
             uri=self.settings.nvidia_riva_server,
             metadata_args=[
-                ["function-id", self.settings.nvidia_parakeet_function_id or ""],
-                ["authorization", f"Bearer {self.settings.nvidia_api_key.get_secret_value()}"],
+                ["function-id", self.settings.nvidia_nim_stt_function_id or ""],
+                ["authorization", f"Bearer {api_key}"],
             ],
         )
         return riva.client.ASRService(auth)
 
 
-class NvidiaParakeetSttStream(SttStream):
+class NvidiaNimSttStream(SttStream):
     def __init__(self, segment_id: str, provider: str, service) -> None:
         self.segment_id = segment_id
         self.provider = provider
@@ -248,7 +260,7 @@ class NvidiaParakeetSttStream(SttStream):
                 return event
         return SttTranscriptEvent(
             event=SttTranscriptEventType.ERROR,
-            text="NVIDIA Parakeet stream ended without a transcript.",
+            text="NVIDIA NIM stream ended without a transcript.",
             segment_id=self.segment_id,
             provider=self.provider,
         )
@@ -318,11 +330,11 @@ def _recognition_config_for_frame(frame: AudioFrame):
     try:
         import riva.client
     except ImportError as exc:
-        raise RuntimeError("Install nvidia-riva-client to use NVIDIA Parakeet STT.") from exc
+        raise RuntimeError("Install nvidia-riva-client to use NVIDIA NIM STT.") from exc
     if frame.encoding != "pcm_s16le":
-        raise RuntimeError(f"NVIDIA Parakeet provider expects pcm_s16le audio, got {frame.encoding}.")
+        raise RuntimeError(f"NVIDIA NIM provider expects pcm_s16le audio, got {frame.encoding}.")
     if frame.channels != 1:
-        raise RuntimeError(f"NVIDIA Parakeet provider expects mono audio, got {frame.channels} channels.")
+        raise RuntimeError(f"NVIDIA NIM provider expects mono audio, got {frame.channels} channels.")
     return riva.client.RecognitionConfig(
         encoding=riva.client.AudioEncoding.LINEAR_PCM,
         sample_rate_hertz=frame.sample_rate,
@@ -382,8 +394,8 @@ def parse_asr_mode(value: str) -> AsrMode:
 
 
 def create_stt_provider(settings: Settings) -> SttProvider:
-    if settings.stt_provider == "nvidia_parakeet":
-        return NvidiaParakeetSttProvider(settings)
+    if settings.stt_provider == "nvidia_nim":
+        return NvidiaNimSttProvider(settings)
     return FakeSttProvider(settings.fake_stt_transcript)
 
 
