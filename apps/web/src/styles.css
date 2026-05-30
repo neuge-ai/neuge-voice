@@ -1,13 +1,23 @@
+/* styles.css */
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 @layer base {
+  ::selection {
+      background-color: rgba(255, 255, 255, 0.2);
+      color: #ffffff;
+  }
+  ::-moz-selection {
+      background-color: rgba(255, 255, 255, 0.2);
+      color: #ffffff;
+  }
+
   body {
     background-color: theme('colors.background');
     color: theme('colors.onSurface');
     overflow: hidden; /* Prevent scrolling on main dashboard */
-    font-family: 'JetBrains Mono', monospace;
+    font-family: 'Inter', sans-serif;
   }
 
   .material-symbols-outlined {
@@ -22,6 +32,11 @@
     font-feature-settings: 'liga';
     -webkit-font-feature-settings: 'liga';
     -webkit-font-smoothing: antialiased;
+  }
+
+  .mask-image-radial-gradient {
+    mask-image: radial-gradient(circle at center, black 40%, transparent 100%);
+    -webkit-mask-image: radial-gradient(circle at center, black 40%, transparent 100%);
   }
 }
 
@@ -42,9 +57,12 @@
 
 @layer components {
   .glass-panel {
-    background: rgba(30, 32, 32, 0.6);
-    backdrop-filter: blur(12px);
-    border: 1px solid rgba(255, 255, 255, 0.05);
+    background: #050505;
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+    box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.4);
   }
 
   .glass-recessed {

@@ -2,11 +2,44 @@
   "name": "nextgen-voice-agent-web",
   "version": "0.1.0",
   "private": true,
+  "author": "NextGen <dev@nextgenvoice.com>",
+  "homepage": "https://github.com/nextgenvoice",
   "type": "module",
+  "main": "main.cjs",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc -b && vite build",
-    "preview": "vite preview --host 127.0.0.1"
+    "preview": "vite preview --host 127.0.0.1",
+    "electron:dev": "concurrently -k \"cross-env BROWSER=none npm run dev\" \"wait-on http://localhost:5173 && cross-env NODE_ENV=development electron . --no-sandbox\"",
+    "electron:build": "npm run build && electron-builder"
+  },
+  "build": {
+    "appId": "com.nextgen.voiceagent",
+    "productName": "NextGen Voice Agent",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "main.cjs",
+      "preload.cjs"
+    ],
+    "extraResources": [
+      {
+        "from": "../../dist/backend",
+        "to": "backend",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Utility"
+    }
   },
   "dependencies": {
     "@vitejs/plugin-react": "4.3.4",
@@ -20,7 +53,12 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "autoprefixer": "^10.5.0",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "electron": "^30.5.1",
+    "electron-builder": "^26.8.1",
     "postcss": "^8.5.15",
-    "tailwindcss": "^3.4.19"
+    "tailwindcss": "^3.4.19",
+    "wait-on": "^9.0.10"
   }
 }

@@ -18,8 +18,8 @@ export function ActivityLog({ isOpen, onClose, events, voiceEvents, isAgentListe
       ${isOpen ? 'md:w-[400px]' : 'md:w-0'}
       h-full
     `}>
-      <div className="w-full md:w-[400px] h-full flex flex-col border-l border-outlineVariant/30 bg-surface md:bg-surface/80 md:backdrop-blur-sm relative">
-        <div className="p-6 border-b border-outlineVariant/30 flex justify-center relative">
+      <div className="w-full md:w-[400px] h-full flex flex-col border-l border-white/10 bg-surface md:bg-surface/80 md:backdrop-blur-sm relative">
+        <div className="p-6 border-b border-white/10 flex justify-center relative">
           <h2 className="text-xs font-bold text-onSurfaceVariant">Activity Log</h2>
           <button 
             className="md:hidden absolute right-6 top-4 text-onSurfaceVariant hover:text-white p-2 rounded-full hover:bg-white/5 transition-colors" 
@@ -51,7 +51,7 @@ export function ActivityLog({ isOpen, onClose, events, voiceEvents, isAgentListe
                   <div className="text-[10px] text-onSurfaceVariant font-mono px-1">
                     <span className="text-onSurfaceVariant opacity-50">{timeStr}</span> <span className="text-secondary font-bold">User</span>
                   </div>
-                  <div className="bg-surfaceContainerHigh border border-outlineVariant/30 text-onSurface px-4 py-3 rounded-2xl rounded-tr-sm max-w-[85%] leading-relaxed shadow-sm">
+                  <div className="bg-surfaceContainerHigh border border-white/10 text-onSurface px-4 py-3 rounded-2xl rounded-tr-sm max-w-[85%] leading-relaxed shadow-sm">
                     "{event.text}"
                   </div>
                 </div>

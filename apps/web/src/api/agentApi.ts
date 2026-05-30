@@ -48,8 +48,24 @@ export type TtsResult = {
   metadata?: Record<string, unknown>;
 };
 
-const API_BASE = import.meta.env.VITE_AGENT_API_BASE ?? "http://127.0.0.1:8000";
-const WS_BASE = API_BASE.replace(/^http/, "ws");
+export let API_BASE = import.meta.env.VITE_AGENT_API_BASE ?? "http://127.0.0.1:8000";
+export let WS_BASE = API_BASE.replace(/^http/, "ws");
+
+export async function initApiBase() {
+  const electronAPI = (window as any).electronAPI;
+  if (electronAPI) {
+    try {
+      const port = await electronAPI.getBackendPort();
+      if (port) {
+        API_BASE = `http://127.0.0.1:${port}`;
+        WS_BASE = API_BASE.replace(/^http/, "ws");
+        console.log(`Electron sidecar detected. API Base set to: ${API_BASE}`);
+      }
+    } catch (e) {
+      console.error("Failed to retrieve port from Electron", e);
+    }
+  }
+}
 
 export async function startTask(task: string): Promise<StartTaskResponse> {
   const response = await fetch(`${API_BASE}/tasks/start`, {

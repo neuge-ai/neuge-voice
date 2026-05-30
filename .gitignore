@@ -10,3 +10,8 @@ plans/
 .env
 .venv/
 venv/
+
+# Build artifacts
+apps/web/release/
+build/
+backend.spec

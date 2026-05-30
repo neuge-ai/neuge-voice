@@ -28,7 +28,7 @@ export function VoiceOrb({ isSpeaking, isListening, isUserSpeaking, userAudioLev
       
       {/* Inner glowing core */}
       <div 
-        className={`absolute inset-0 m-auto w-3/4 h-3/4 rounded-full blur-xl opacity-60 transition-all duration-500 ${
+        className={`absolute inset-0 m-auto w-3/4 h-3/4 rounded-full blur-xl opacity-60 transition-all duration-500 animate-orb-morph ${
           state === 'idle' ? 'bg-primary animate-pulse-slow' :
           state === 'ai-speaking' ? 'bg-primary animate-ai-speech-pulse' :
           state === 'listening' ? 'bg-cyanCore animate-pulse-slow' :

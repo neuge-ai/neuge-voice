@@ -1,9 +1,42 @@
-import { type AgentEvent } from "../../api/agentApi";
+import { useState, useEffect } from "react";
+import { type AgentEvent, API_BASE } from "../../api/agentApi";
 import { useActiveTools } from "../../hooks/useActiveTools";
 import { Link } from "react-router-dom";
 
 export function SideNav({ events = [], isOpen = false, onClose = () => {} }: { events?: AgentEvent[], isOpen?: boolean, onClose?: () => void }) {
   const { activeTools } = useActiveTools();
+  const [healthState, setHealthState] = useState<'online' | 'config_missing' | 'offline' | 'loading'>('loading');
+
+  useEffect(() => {
+    const checkHealth = async () => {
+      try {
+        const healthRes = await fetch(`${API_BASE}/health`);
+        if (!healthRes.ok) {
+          setHealthState('offline');
+          return;
+        }
+        
+        const configRes = await fetch(`${API_BASE}/api/config/status`);
+        if (!configRes.ok) {
+          setHealthState('offline');
+          return;
+        }
+
+        const configData = await configRes.json();
+        if (configData.system_ready) {
+          setHealthState('online');
+        } else {
+          setHealthState('config_missing');
+        }
+      } catch (err) {
+        setHealthState('offline');
+      }
+    };
+
+    checkHealth();
+    const interval = setInterval(checkHealth, 5000);
+    return () => clearInterval(interval);
+  }, []);
 
   const formatElapsed = (ms: number) => {
     const totalSeconds = Math.floor(ms / 1000);
@@ -14,7 +47,7 @@ export function SideNav({ events = [], isOpen = false, onClose = () => {} }: { e
   };
 
   return (
-    <aside className={`w-80 h-full flex flex-col border-r border-outlineVariant/30 bg-surface/80 backdrop-blur-sm z-10 fixed md:relative left-0 top-0 transition-transform duration-300 md:translate-x-0 ${isOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}`}>
+    <aside className={`w-72 h-full flex flex-col border-r border-white/10 bg-surface/80 backdrop-blur-md z-10 fixed md:relative left-0 top-0 transition-transform duration-300 md:translate-x-0 ${isOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}`}>
       
       {/* Header */}
       <div className="p-6 flex justify-between items-center">
@@ -26,15 +59,35 @@ export function SideNav({ events = [], isOpen = false, onClose = () => {} }: { e
 
       {/* Navigation */}
       <nav className="px-4 py-2">
-        <div className="glass-panel rounded-xl p-3 flex items-center gap-4 cursor-pointer hover:bg-surfaceContainerHigh transition-colors group">
-          <div className="w-8 h-8 rounded-lg bg-surfaceContainerHighest flex items-center justify-center text-primary group-hover:bg-primary group-hover:text-onPrimary transition-colors">
-            <svg fill="none" height="16" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 24 24" width="16" xmlns="http://www.w3.org/2000/svg"><path d="M3 3v18h18"></path><path d="M18 17V9"></path><path d="M13 17V5"></path><path d="M8 17v-3"></path></svg>
+        <Link to="/settings" className="glass-panel rounded-xl p-3 flex items-center gap-4 cursor-pointer hover:bg-surfaceContainerHigh transition-colors group">
+          <div className={`w-8 h-8 rounded-lg flex items-center justify-center transition-colors ${
+          healthState === 'offline' ? 'bg-red-500/10 text-red-500' : 
+            healthState === 'config_missing' ? 'bg-[#ffb869]/10 text-[#ffb869] shadow-[0_0_15px_rgba(255,184,105,0.2)]' : 
+            healthState === 'online' ? 'bg-green-500/10 text-green-500' : 'bg-white/5 text-white/50'
+          }`}>
+            {healthState === 'online' ? (
+              <span className="material-symbols-outlined text-[16px]">monitor_heart</span>
+            ) : healthState === 'config_missing' ? (
+              <span className="material-symbols-outlined text-[16px]">warning</span>
+            ) : healthState === 'offline' ? (
+              <span className="material-symbols-outlined text-[16px]">cloud_off</span>
+            ) : (
+              <span className="material-symbols-outlined text-[16px] animate-spin">sync</span>
+            )}
           </div>
           <div>
             <div className="font-bold text-onSurface">Overview</div>
-            <div className="font-label-sm text-label-sm text-onSurfaceVariant mt-0.5">Dashboard Active</div>
+            <div className={`font-label-sm text-label-sm mt-0.5 ${
+              healthState === 'offline' ? 'text-red-500' : 
+              healthState === 'config_missing' ? 'text-[#ffb869]' : 
+              healthState === 'online' ? 'text-green-500' : 'text-onSurfaceVariant'
+            }`}>
+              {healthState === 'online' ? 'System Ready' : 
+               healthState === 'config_missing' ? 'Config Required' : 
+               healthState === 'offline' ? 'Backend Offline' : 'Checking Status...'}
+            </div>
           </div>
-        </div>
+        </Link>
       </nav>
 
       {/* Active Tools */}
@@ -70,7 +123,7 @@ export function SideNav({ events = [], isOpen = false, onClose = () => {} }: { e
       </div>
 
       {/* Footer Settings */}
-      <div className="p-6 border-t border-outlineVariant/30 flex justify-between items-center text-onSurfaceVariant">
+      <div className="p-6 border-t border-white/10 flex justify-between items-center text-onSurfaceVariant">
         <Link to="/settings" className="flex-1 flex items-center gap-2 px-3 py-2 -ml-3 mr-2 rounded-lg hover:bg-white/5 hover:text-onSurface transition-colors font-label-sm text-label-sm">
           <svg fill="none" height="16" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 24 24" width="16" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
           Settings
