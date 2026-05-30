@@ -1,3 +1,5 @@
+import { API_BASE } from "../api/agentApi";
+
 export type BrowserVoiceEventType =
   | "session_started"
   | "session_stopped"
@@ -33,7 +35,7 @@ export type BrowserVoiceEvent = {
   created_at: string;
 };
 
-export type VoiceEventInput = Omit<BrowserVoiceEvent, "transport" | "session_id">;
+export type VoiceEventInput = Omit<BrowserVoiceEvent, "transport" | "session_id" | "created_at">;
 
 export class BrowserVoiceTransport {
   private readonly apiBase: string;
@@ -41,7 +43,7 @@ export class BrowserVoiceTransport {
   public peerConnection: RTCPeerConnection | null = null;
   public audioContext: AudioContext;
 
-  constructor(apiBase = import.meta.env.VITE_AGENT_API_BASE ?? "http://127.0.0.1:8000") {
+  constructor(apiBase = API_BASE) {
     this.apiBase = apiBase;
     this.sessionIdValue = crypto.randomUUID();
     this.audioContext = new AudioContext();
@@ -117,6 +119,7 @@ export class BrowserVoiceTransport {
       transport: "browser",
       session_id: this.sessionIdValue,
       metadata: event.metadata ?? {},
+      created_at: new Date().toISOString(),
     };
   }
 }

@@ -16,6 +16,7 @@ dependencies = [
   "numpy>=2.4.6",
   "keyring>=25.7.0",
   "tomli-w>=1.2.0",
+  "pyinstaller>=6.20.0",
 ]
 
 [project.optional-dependencies]
