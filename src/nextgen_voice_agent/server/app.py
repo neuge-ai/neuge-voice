@@ -12,6 +12,8 @@ from nextgen_voice_agent.voice.stt import parse_asr_mode
 
 def create_app() -> FastAPI:
     settings = get_settings()
+    from nextgen_voice_agent.config import inject_llm_secrets
+    inject_llm_secrets()
     app = FastAPI(title=settings.app_name)
     app.state.controller = create_controller(settings)
     app.state.stt_provider = create_stt(settings)

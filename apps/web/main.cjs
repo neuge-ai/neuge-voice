@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, systemPreferences } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
 
@@ -67,8 +67,20 @@ async function createWindow() {
   }
 }
 
+async function ensureMicrophonePermission() {
+  if (process.platform !== "darwin") return true;
+  const status = systemPreferences.getMediaAccessStatus("microphone");
+  if (status === "granted") return true;
+  if (status === "denied" || status === "restricted") return false;
+  return await systemPreferences.askForMediaAccess("microphone");
+}
+
 app.whenReady().then(async () => {
   try {
+    const hasMic = await ensureMicrophonePermission();
+    if (!hasMic) {
+      console.warn("Microphone permission denied! Voice features will not work on macOS.");
+    }
     await spawnBackend();
   } catch (e) {
     console.error("Failed to spawn backend:", e);
