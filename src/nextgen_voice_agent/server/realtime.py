@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+"""Optional OpenAI Realtime API integration.
+
+The current integrated voice path runs through voice/orchestrator.py and
+voice/llm_router.py. This module only builds session/tool config for a direct
+OpenAI Realtime client path for future integration.
+"""
+
 import asyncio
 import json
 import urllib.error
@@ -25,7 +32,10 @@ def build_realtime_session_config(settings: Settings) -> RealtimeSessionConfig:
             "For timers, activity tracking, elapsed-time checks, and cancellation/status checks, "
             "call native deterministic tools instead of Codex. "
             "Only one Codex task may run at a time. If a Codex task is already active, "
-            "do not start another complex task; ask whether to cancel/switch or keep the current task running. "
+            "do not start another complex task. For related follow-ups to the active task, call "
+            "`amend_codex_task` with only the new instruction or correction; the Codex app-server keeps "
+            "the same thread context. For clearly unrelated new complex work, ask whether to cancel/switch "
+            "or keep the current task running. "
             "Native tools and simple conversation remain available while Codex runs. "
             "Keep speech concise, stay interruptible, and never claim a Codex task is "
             "finished until read_codex_result returns a completed result.\n\n"
@@ -48,7 +58,10 @@ def build_realtime_session_config(settings: Settings) -> RealtimeSessionConfig:
             ),
             RealtimeTool(
                 name="amend_codex_task",
-                description="Apply a user amendment to a running Codex task.",
+                description=(
+                    "Steer the active running Codex task with a related follow-up, correction, or added constraint. "
+                    "Send only the new instruction, not a full rewritten task."
+                ),
                 parameters={
                     "type": "object",
                     "additionalProperties": False,

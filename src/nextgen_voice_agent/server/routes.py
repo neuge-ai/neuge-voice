@@ -23,7 +23,7 @@ from nextgen_voice_agent.server.realtime import build_realtime_session_config, c
 from nextgen_voice_agent.voice.orchestrator import VoiceSessionOrchestrator
 from nextgen_voice_agent.voice.tts import TtsProvider, TtsProviderError, TtsRequest, TtsResult
 
-from . import codex_cli
+from . import codex_app_server
 
 router = APIRouter()
 
@@ -104,7 +104,13 @@ async def call_realtime_tool(
                     "message": "A Codex task is already active.",
                     "attempted_task": task_text,
                     "active_task": active_task.model_dump(mode="json") if active_task else None,
-                    "allowed_next_actions": ["cancel_active_task", "keep_active_task", "use_native_tool", "answer_directly"],
+                    "allowed_next_actions": [
+                        "amend_active_task",
+                        "cancel_active_task",
+                        "keep_active_task",
+                        "use_native_tool",
+                        "answer_directly",
+                    ],
                 }
         if tool_name == "amend_codex_task":
             result = await controller.amend_task(
@@ -306,7 +312,7 @@ async def get_active_tools(
 @router.get("/api/codex/mcp-tools")
 async def fetch_mcp_tools() -> dict[str, object]:
     try:
-        tools = await codex_cli.get_mcp_tools()
+        tools = await codex_app_server.get_mcp_tools()
         return {"servers": tools}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -314,7 +320,7 @@ async def fetch_mcp_tools() -> dict[str, object]:
 @router.post("/api/codex/mcp-tools")
 async def create_mcp_tool(request: AddMcpToolRequest) -> dict[str, object]:
     try:
-        await codex_cli.add_mcp_tool(request.name, request.command, request.args)
+        await codex_app_server.add_mcp_tool(request.name, request.command, request.args)
         return {"success": True, "message": f"MCP tool '{request.name}' added."}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -322,7 +328,7 @@ async def create_mcp_tool(request: AddMcpToolRequest) -> dict[str, object]:
 @router.delete("/api/codex/mcp-tools/{tool_name}")
 async def delete_mcp_tool(tool_name: str) -> dict[str, object]:
     try:
-        await codex_cli.remove_mcp_tool(tool_name)
+        await codex_app_server.remove_mcp_tool(tool_name)
         return {"success": True, "message": f"MCP tool '{tool_name}' removed."}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

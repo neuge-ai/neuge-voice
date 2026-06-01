@@ -516,6 +516,7 @@ async def test_orchestrator_blocks_second_codex_task_with_graceful_response() ->
     assert conflict["error_code"] == "codex_task_conflict"
     assert conflict["recoverable"] is True
     assert conflict["active_task"]["task_id"] == first_task_id
+    assert "amend_active_task" in conflict["allowed_next_actions"]
     await orchestrator.stop_session(session_id)
 
 
@@ -535,6 +536,7 @@ async def test_orchestrator_allows_native_timer_while_codex_task_runs() -> None:
                     "assistant_response": "I'll start that.",
                 }
             assert '"can_start_new_codex_task": false' in system_state
+            assert '"can_amend_active_codex_task": true' in system_state
             return {
                 "type": "tool_call",
                 "tool": "start_timer",
@@ -570,6 +572,27 @@ async def test_orchestrator_allows_native_timer_while_codex_task_runs() -> None:
     ]
     assert timer_tool_messages
     assert timer_tool_messages[-1].get("tool_call_id", "").startswith("call_start_timer_")
+    await orchestrator.stop_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_state_marks_active_codex_task_as_amendable() -> None:
+    controller = AgentController(runtime=FakeRuntime(delay_seconds=1.0))
+    orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10))
+    session_id = "browser-session"
+
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(event=VoiceEventType.USER_TURN, transport=VoiceTransportKind.BROWSER, session_id=session_id, text="Analyze the repo."),
+    )
+
+    state = orchestrator.sessions[session_id]
+    payload = orchestrator._session_state_payload(state)
+
+    assert payload["codex_concurrency"]["can_start_new_codex_task"] is False
+    assert payload["codex_concurrency"]["can_amend_active_codex_task"] is True
+    assert payload["active_codex_tasks"][0]["original_request"] == "Analyze the repo."
+    assert payload["active_codex_tasks"][0]["amendable"] is True
     await orchestrator.stop_session(session_id)
 
 

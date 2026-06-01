@@ -3,7 +3,8 @@ import subprocess
 import sys
 
 def build():
-    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    os.chdir(repo_root)
     
     # We must include uvicorn standard hidden imports so the server can boot
     hidden_imports = [
@@ -28,6 +29,10 @@ def build():
         "--collect-all", "tiktoken",
         "--collect-all", "tiktoken_ext",
     ]
+
+    web_dist = os.path.join("apps", "web", "dist")
+    if os.path.exists(os.path.join(web_dist, "index.html")):
+        cmd.extend(["--add-data", f"{web_dist}{os.pathsep}{web_dist}"])
     
     for imp in hidden_imports:
         cmd.extend(["--hidden-import", imp])

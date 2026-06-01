@@ -48,6 +48,13 @@ export type TtsResult = {
   metadata?: Record<string, unknown>;
 };
 
+export type OpenConfigFileResult = {
+  opened: boolean;
+  path: string;
+  method?: string;
+  error?: string;
+};
+
 export let API_BASE = import.meta.env.VITE_AGENT_API_BASE ?? "http://127.0.0.1:8000";
 export let WS_BASE = API_BASE.replace(/^http/, "ws");
 
@@ -60,11 +67,34 @@ export async function initApiBase() {
         API_BASE = `http://127.0.0.1:${port}`;
         WS_BASE = API_BASE.replace(/^http/, "ws");
         console.log(`Electron sidecar detected. API Base set to: ${API_BASE}`);
+        return;
       }
     } catch (e) {
       console.error("Failed to retrieve port from Electron", e);
     }
   }
+
+  if (import.meta.env.VITE_AGENT_API_BASE) {
+    return;
+  }
+
+  // When the Python backend serves the bundled UI, use the page origin so the
+  // API port matches (e.g. http://127.0.0.1:51237 instead of hardcoded :8000).
+  const { protocol, port } = window.location;
+  const isViteDevServer = import.meta.env.DEV && port === "5173";
+  if (!isViteDevServer && (protocol === "http:" || protocol === "https:")) {
+    API_BASE = window.location.origin;
+    WS_BASE = API_BASE.replace(/^http/, "ws");
+    console.log(`Using page origin as API base: ${API_BASE}`);
+  }
+}
+
+export async function openConfigFile(): Promise<OpenConfigFileResult> {
+  const response = await fetch(`${API_BASE}/api/config/open`, { method: "POST" });
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  return response.json();
 }
 
 export async function startTask(task: string): Promise<StartTaskResponse> {

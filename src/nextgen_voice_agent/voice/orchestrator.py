@@ -1033,6 +1033,7 @@ class VoiceSessionOrchestrator:
                 "max_active_codex_tasks": 1,
                 "active_codex_task_count": 1 if active_task else 0,
                 "can_start_new_codex_task": active_task is None,
+                "can_amend_active_codex_task": active_task is not None and bool(active_task.get("amendable")),
                 "native_tools_available_while_codex_runs": True,
             },
             "active_timers": [self._timer_payload(timer, now) for timer in state.active_timers.values() if timer.status == "running"],
@@ -1125,7 +1126,7 @@ class VoiceSessionOrchestrator:
             return "I already have a background task running. I can cancel it and start the new one, or keep the current one going."
         return (
             "I already have a background task running: "
-            f"{task.original_request}. I can cancel it and start the new one, or keep this one going while we handle simpler things."
+            f"{task.original_request}. If this is a change to that task, I can add it; otherwise I can cancel it and start the new one, or keep this one going while we handle simpler things."
         )
 
     def _codex_task_conflict_payload(self, state: VoiceSessionState, attempted_task: str) -> dict[str, Any]:
@@ -1145,7 +1146,13 @@ class VoiceSessionOrchestrator:
             "message": self._active_task_conflict_message(state),
             "attempted_task": attempted_task,
             "active_task": active_task,
-            "allowed_next_actions": ["cancel_active_task", "keep_active_task", "use_native_tool", "answer_directly"],
+            "allowed_next_actions": [
+                "amend_active_task",
+                "cancel_active_task",
+                "keep_active_task",
+                "use_native_tool",
+                "answer_directly",
+            ],
         }
 
     def _timer_payload(self, timer: SessionTimer, now: datetime) -> dict[str, Any]:
@@ -1187,7 +1194,9 @@ class VoiceSessionOrchestrator:
             "task_id": task.task_id,
             "type": "codex",
             "status": task.status.value,
+            "original_request": task.original_request,
             "user_visible_status": task.user_visible_status,
+            "amendable": bool(getattr(task, "amendable", False)),
             "elapsed_ms": max(0, elapsed_ms),
             "last_meaningful_progress_ms_ago": max(0, last_progress_ms_ago),
             "last_spoken_update_ms_ago": int(self._elapsed_ms(state.last_progress_spoken_at)) if state.last_progress_spoken_at else None,

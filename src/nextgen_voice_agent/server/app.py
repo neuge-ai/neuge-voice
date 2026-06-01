@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+import os
+import sys
+import mimetypes
+from pathlib import Path
+
+from fastapi import HTTPException
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, Response
 
 from nextgen_voice_agent.config import get_settings
 from nextgen_voice_agent.server.dependencies import create_controller, create_stt, create_tts
@@ -45,9 +52,15 @@ def create_app() -> FastAPI:
             "effective_asr_mode": app.state.voice_orchestrator.effective_asr_mode.value,
         }
 
+    @app.on_event("shutdown")
+    async def shutdown_runtime() -> None:
+        shutdown = getattr(app.state.controller.runtime, "shutdown", None)
+        if shutdown is not None:
+            await shutdown()
+
     @app.get("/api/config/status")
     async def config_status() -> dict:
-        from nextgen_voice_agent.config import get_settings, get_secret
+        from nextgen_voice_agent.config import CONFIG_FILE, get_settings, get_secret
         settings = get_settings()
 
         llm_provider = settings.router_model.split("/")[0].lower()
@@ -106,12 +119,63 @@ def create_app() -> FastAPI:
             "missing_capabilities": missing_capabilities,
             "active_config": active_config,
             "default_config": default_config,
-            "providers_schema": providers_schema
+            "providers_schema": providers_schema,
+            "config_path": str(CONFIG_FILE),
         }
+
+    @app.post("/api/config/open")
+    async def open_config() -> dict[str, str | bool]:
+        from nextgen_voice_agent.platform.open_file import open_config_file
+
+        return open_config_file()
 
     app.include_router(routes.router)
     app.include_router(websocket.router)
+    mount_frontend(app)
     return app
+
+
+def mount_frontend(app: FastAPI) -> None:
+    web_dist = find_web_dist()
+    if web_dist is None:
+        return
+
+    assets_dir = web_dist / "assets"
+    index_path = web_dist / "index.html"
+
+    if assets_dir.exists():
+
+        @app.get("/assets/{asset_path:path}", include_in_schema=False)
+        async def frontend_asset(asset_path: str) -> Response:
+            path = (assets_dir / asset_path).resolve()
+            if not path.is_file() or assets_dir.resolve() not in path.parents:
+                raise HTTPException(status_code=404, detail="Asset not found.")
+            media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            return Response(path.read_bytes(), media_type=media_type)
+
+    @app.get("/", include_in_schema=False)
+    async def frontend_index() -> HTMLResponse:
+        return HTMLResponse(index_path.read_text(encoding="utf-8"))
+
+
+def find_web_dist() -> Path | None:
+    candidates: list[Path] = []
+    env_path = os.getenv("NVA_WEB_DIST")
+    if env_path:
+        candidates.append(Path(env_path))
+
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        candidates.append(Path(bundle_root) / "apps" / "web" / "dist")
+        candidates.append(Path(bundle_root) / "web")
+
+    repo_root = Path(__file__).resolve().parents[3]
+    candidates.append(repo_root / "apps" / "web" / "dist")
+
+    for candidate in candidates:
+        if (candidate / "index.html").exists():
+            return candidate
+    return None
 
 
 app = create_app()

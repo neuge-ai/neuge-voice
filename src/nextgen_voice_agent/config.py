@@ -13,7 +13,7 @@ class Settings(BaseModel):
 
     app_name: str = "Neuge Voice"
     environment: str = "development"
-    runtime: str = Field(default="fake", description="Runtime adapter: fake or codex_cli.")
+    runtime: str = Field(default="fake", description="Runtime adapter: fake or codex_app_server.")
     codex_command: str = "codex"
     codex_model: str = "gpt-5.4-mini"
     openai_realtime_model: str = "gpt-realtime-mini"

@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { API_BASE } from "../api/agentApi";
+import { API_BASE, openConfigFile } from "../api/agentApi";
 
 // Custom premium select component
 function CustomSelect({ value, onChange, options, loadingText = "Loading..." }: { value: string, onChange: (v: string) => void, options: {value: string, label: string}[], loadingText?: string }) {
@@ -53,6 +53,7 @@ export function Settings() {
   const [settings, setSettings] = useState<any>({});
   const [configStatus, setConfigStatus] = useState<any>({});
   const [secretInputs, setSecretInputs] = useState<Record<string, string>>({});
+  const [configOpenError, setConfigOpenError] = useState<string | null>(null);
 
   const getRequiredSecrets = () => {
     if (!configStatus?.active_config || !configStatus?.providers_schema) return [];
@@ -94,9 +95,24 @@ export function Settings() {
 
   const dynamicSecrets = getRequiredSecrets();
 
-  const handleOpenConfig = () => {
-    // TODO: Connect to Electron IPC (shell.openPath) or Python fallback in the future
-    console.log("Opening config.toml in default editor...");
+  const handleOpenConfig = async () => {
+    setConfigOpenError(null);
+    try {
+      const result = await openConfigFile();
+      if (!result.opened) {
+        setConfigOpenError(result.path);
+      }
+    } catch (e) {
+      const fallbackPath = configStatus?.config_path;
+      if (fallbackPath) {
+        setConfigOpenError(fallbackPath);
+      } else {
+        setConfigOpenError(
+          e instanceof Error ? e.message : "Could not reach the local backend.",
+        );
+      }
+      console.error(e);
+    }
   };
 
   useEffect(() => {
@@ -283,6 +299,24 @@ export function Settings() {
                   Open config.toml <span className="material-symbols-outlined text-[14px]">north_east</span>
                 </div>
               </div>
+
+              {configOpenError && (
+                <div className="px-6 py-4 border-b border-white/5 bg-white/5">
+                  <p className="font-label-sm text-label-sm text-on-surface-muted mb-2">
+                    Could not open automatically — copy the path and open manually:
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <code className="flex-1 text-sm text-primary bg-black/20 rounded px-3 py-2 truncate">{configOpenError}</code>
+                    <button
+                      type="button"
+                      className="text-sm text-on-surface-muted hover:text-white transition-colors shrink-0"
+                      onClick={() => navigator.clipboard.writeText(configOpenError)}
+                    >
+                      Copy
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {/* Voice Routing Provider */}
               <div className="px-6 py-4 flex items-center justify-between hover:bg-white/5 transition-colors border-b border-white/5 relative z-30">
