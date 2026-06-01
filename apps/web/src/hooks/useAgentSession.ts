@@ -160,6 +160,8 @@ export function useAgentSession() {
   }, []);
 
   const resumeTts = useCallback(() => {
+    // HTML Audio resume is reliable; speechSynthesis.resume() is best-effort only.
+    // After stop_assistant_audio (flush), playback cannot resume — only pause/resume pairs are recoverable.
     ttsPausedRef.current = false;
     if (audioRef.current) {
       if (transport.audioContext.state === 'suspended') {
@@ -399,8 +401,7 @@ export function useAgentSession() {
 
         if (
           (event.event === "assistant_response" ||
-            event.event === "delivery_ready" ||
-            event.event === "task_status") &&
+            event.event === "delivery_ready") &&
           event.text
         ) {
           ttsQueue.current.enqueue(

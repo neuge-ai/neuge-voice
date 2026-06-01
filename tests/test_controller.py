@@ -107,4 +107,8 @@ async def test_failed_runtime_result_clears_active_task() -> None:
 
     assert controller.active_task_id is None
     assert controller.get_status(task_id).task.status == TaskStatus.FAILED
+    result = controller.read_result(task_id)
+    assert result is not None
+    assert result.status == RuntimeResultStatus.FAILED
+    assert result.error == "Codex completed without writing the structured result file."
     assert controller.event_hub.history[-1].event == EventType.TASK_FAILED

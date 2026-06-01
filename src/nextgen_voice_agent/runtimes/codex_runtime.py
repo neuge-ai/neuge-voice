@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -67,32 +68,35 @@ class CodexAppServerClient:
         self._stderr_task: asyncio.Task[None] | None = None
         self._write_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
+        self._initialized = False
 
     async def start(self) -> None:
         async with self._start_lock:
-            if self.process is not None and self.process.returncode is None:
+            if self.process is not None and self.process.returncode is None and self._initialized:
                 return
-            try:
-                self.process = await asyncio.wait_for(
-                    self.process_factory(
-                        self.command,
-                        "app-server",
-                        "--listen",
-                        "stdio://",
-                        stdin=asyncio.subprocess.PIPE,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    ),
-                    timeout=self.config.startup_timeout_seconds,
-                )
-            except TimeoutError as exc:
-                raise TimeoutError(
-                    f"Codex app-server did not start within {self.config.startup_timeout_seconds:g} seconds."
-                ) from exc
+            if self.process is None or self.process.returncode is not None:
+                try:
+                    self.process = await asyncio.wait_for(
+                        self.process_factory(
+                            self.command,
+                            "app-server",
+                            "--listen",
+                            "stdio://",
+                            stdin=asyncio.subprocess.PIPE,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        ),
+                        timeout=self.config.startup_timeout_seconds,
+                    )
+                except TimeoutError as exc:
+                    raise TimeoutError(
+                        f"Codex app-server did not start within {self.config.startup_timeout_seconds:g} seconds."
+                    ) from exc
 
-            logger.info("Codex app-server started with pid %s", getattr(self.process, "pid", None))
-            self._reader_task = asyncio.create_task(self._read_stdout_loop())
-            self._stderr_task = asyncio.create_task(self._read_stderr_loop())
+                logger.info("Codex app-server started with pid %s", getattr(self.process, "pid", None))
+                self._reader_task = asyncio.create_task(self._read_stdout_loop())
+                self._stderr_task = asyncio.create_task(self._read_stderr_loop())
+            await self._initialize()
 
     async def stop(self) -> None:
         process = self.process
@@ -110,9 +114,13 @@ class CodexAppServerClient:
             if task and not task.done():
                 task.cancel()
         self.process = None
+        self._initialized = False
 
     async def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
         await self.start()
+        return await self._request_started(method, params)
+
+    async def _request_started(self, method: str, params: dict[str, Any] | None = None) -> Any:
         process = self.process
         if process is None or process.stdin is None or process.returncode is not None:
             raise CodexAppServerError("Codex app-server is not running.")
@@ -139,6 +147,26 @@ class CodexAppServerClient:
         except TimeoutError:
             self._pending.pop(request_id, None)
             raise TimeoutError(f"Codex app-server request timed out: {method}")
+
+    async def _initialize(self) -> None:
+        if self._initialized:
+            return
+        await self._request_started(
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": "neuge-voice-agent",
+                    "title": "Neuge Voice Agent",
+                    "version": "0.1.0",
+                },
+                "capabilities": {
+                    "experimentalApi": True,
+                    "requestAttestation": False,
+                    "optOutNotificationMethods": [],
+                },
+            },
+        )
+        self._initialized = True
 
     async def subscribe(self) -> AsyncIterator[dict[str, Any]]:
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -336,7 +364,6 @@ class CodexAppServerRuntime(TaskRuntime):
         thread_id: str,
         event_queue: asyncio.Queue[RuntimeMessage],
     ) -> None:
-        final_text_parts: list[str] = []
         event_summaries: list[str] = []
         async for notification in self.client.subscribe():
             method = str(notification.get("method", ""))
@@ -355,24 +382,13 @@ class CodexAppServerRuntime(TaskRuntime):
                 event_summaries.append(progress.message)
                 await event_queue.put(progress)
 
-            if method == "agentMessage/delta":
-                delta = params.get("delta")
-                if isinstance(delta, str):
-                    final_text_parts.append(delta)
-                continue
-
-            if method == "item/completed":
-                item_text = self._extract_text(params.get("item"))
-                if item_text:
-                    final_text_parts.append(item_text)
-                continue
-
             if method == "turn/completed":
+                final_text = self._extract_final_assistant_text(params.get("turn"))
                 await event_queue.put(
                     self._build_result(
                         request,
                         generation,
-                        "".join(final_text_parts).strip(),
+                        final_text,
                         "\n".join(event_summaries)[-2000:],
                     )
                 )
@@ -417,10 +433,9 @@ class CodexAppServerRuntime(TaskRuntime):
                 technical_summary="Codex turn was cancelled before its result was accepted.",
             )
         try:
-            payload = self._parse_json_object(final_text)
-            result = RuntimeResult.model_validate(payload)
+            result = self._parse_runtime_result_json(final_text)
             return result.model_copy(update={"task_id": request.task_id, "generation": generation})
-        except (json.JSONDecodeError, ValueError) as exc:
+        except ValueError as exc:
             return RuntimeResult(
                 task_id=request.task_id,
                 generation=generation,
@@ -444,7 +459,13 @@ class CodexAppServerRuntime(TaskRuntime):
             return self._progress(request.task_id, generation, CodexRuntimeState.RUNNING, "Codex started a work item.")
         if method == "item/completed":
             return self._progress(request.task_id, generation, CodexRuntimeState.RUNNING, "Codex completed a work item.")
-        if method in {"plan/delta", "agentMessage/delta", "reasoningText/delta", "reasoningSummaryText/delta"}:
+        if method in {
+            "plan/delta",
+            "agentMessage/delta",
+            "item/agentMessage/delta",
+            "reasoningText/delta",
+            "reasoningSummaryText/delta",
+        }:
             delta = params.get("delta")
             if isinstance(delta, str) and delta.strip():
                 return self._progress(request.task_id, generation, CodexRuntimeState.RUNNING, delta.strip()[:500])
@@ -477,29 +498,41 @@ class CodexAppServerRuntime(TaskRuntime):
         value = response.get("turnId") or response.get("id")
         return value if isinstance(value, str) else None
 
-    def _extract_text(self, value: Any) -> str:
-        if isinstance(value, str):
-            return value
-        if isinstance(value, list):
-            return "".join(self._extract_text(item) for item in value)
-        if not isinstance(value, dict):
+    def _extract_final_assistant_text(self, turn: Any) -> str:
+        if not isinstance(turn, dict):
             return ""
-        text = value.get("text") or value.get("content")
-        if isinstance(text, str):
-            return text
-        if isinstance(text, list):
-            return "".join(self._extract_text(item) for item in text)
+        items = turn.get("items")
+        if not isinstance(items, list):
+            return ""
+        assistant_texts: list[tuple[bool, str]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") not in {"agentMessage", "assistant_message", "assistant"}:
+                continue
+            text = item.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            assistant_texts.append((item.get("phase") == "final_answer", text.strip()))
+        for is_final, text in reversed(assistant_texts):
+            if is_final:
+                return text
+        if assistant_texts:
+            return assistant_texts[-1][1]
         return ""
 
-    def _parse_json_object(self, text: str) -> Any:
+    def _parse_runtime_result_json(self, text: str) -> RuntimeResult:
+        candidate = self._unwrap_json_fence(text.strip())
         try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start == -1 or end == -1 or end <= start:
-                raise
-            return json.loads(text[start : end + 1])
+            return RuntimeResult.model_validate_json(candidate)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+
+    def _unwrap_json_fence(self, text: str) -> str:
+        match = re.fullmatch(r"```(?:json)?\s*\n(?P<body>[\s\S]*?)\n?```", text, flags=re.IGNORECASE)
+        if match is None:
+            return text
+        return match.group("body").strip()
 
     def _progress(
         self,

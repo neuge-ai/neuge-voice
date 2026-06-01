@@ -23,6 +23,28 @@ def runtime_request() -> RuntimeTaskRequest:
     )
 
 
+def completed_turn_notification(result_text: str, *, extra_items: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    return {
+        "method": "turn/completed",
+        "params": {
+            "threadId": "thread_1",
+            "turnId": "turn_1",
+            "turn": {
+                "id": "turn_1",
+                "items": [
+                    *(extra_items or []),
+                    {
+                        "id": "item_final",
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": result_text,
+                    },
+                ],
+            },
+        },
+    }
+
+
 class FakeClient:
     def __init__(self) -> None:
         self.requests: list[tuple[str, dict[str, Any] | None]] = []
@@ -123,7 +145,20 @@ async def test_codex_app_server_client_spawns_and_routes_response() -> None:
     await client.stop()
 
     assert process.args == ("codex", "app-server", "--listen", "stdio://")
-    assert process.stdin.writes[0]["method"] == "example/method"
+    assert process.stdin.writes[0]["method"] == "initialize"
+    assert process.stdin.writes[0]["params"] == {
+        "clientInfo": {
+            "name": "neuge-voice-agent",
+            "title": "Neuge Voice Agent",
+            "version": "0.1.0",
+        },
+        "capabilities": {
+            "experimentalApi": True,
+            "requestAttestation": False,
+            "optOutNotificationMethods": [],
+        },
+    }
+    assert process.stdin.writes[1]["method"] == "example/method"
     assert response == {"ok": True}
 
 
@@ -140,19 +175,7 @@ async def test_codex_runtime_starts_thread_and_turn_with_schema() -> None:
     )
     worker = asyncio.create_task(collect_results(runtime))
     await asyncio.sleep(0)
-    await client.notifications.put(
-        {
-            "method": "agentMessage/delta",
-            "params": {
-                "threadId": "thread_1",
-                "turnId": "turn_1",
-                "delta": json.dumps(result.model_dump(mode="json")),
-            },
-        }
-    )
-    await client.notifications.put(
-        {"method": "turn/completed", "params": {"threadId": "thread_1", "turnId": "turn_1", "turn": {"id": "turn_1"}}}
-    )
+    await client.notifications.put(completed_turn_notification(result.model_dump_json()))
 
     messages = await worker
 
@@ -175,11 +198,85 @@ async def test_codex_runtime_invalid_final_json_fails() -> None:
 
     worker = asyncio.create_task(collect_results(runtime))
     await asyncio.sleep(0)
-    await client.notifications.put(
-        {"method": "agentMessage/delta", "params": {"threadId": "thread_1", "turnId": "turn_1", "delta": "{not-json"}}
+    await client.notifications.put(completed_turn_notification("{not-json"))
+
+    messages = await worker
+
+    assert messages[-1].status == RuntimeResultStatus.FAILED
+    assert "not valid RuntimeResult JSON" in messages[-1].error
+
+
+@pytest.mark.asyncio
+async def test_codex_runtime_uses_final_assistant_item_from_completed_turn() -> None:
+    client = FakeClient()
+    runtime = CodexAppServerRuntime(client=client)
+    result = RuntimeResult(
+        task_id="task_codex",
+        generation=1,
+        status=RuntimeResultStatus.COMPLETED,
+        spoken_answer="Done.",
+        technical_summary="ok",
     )
+
+    worker = asyncio.create_task(collect_results(runtime))
+    await asyncio.sleep(0)
     await client.notifications.put(
-        {"method": "turn/completed", "params": {"threadId": "thread_1", "turnId": "turn_1", "turn": {"id": "turn_1"}}}
+        completed_turn_notification(
+            result.model_dump_json(),
+            extra_items=[
+                {"id": "reasoning_1", "type": "reasoning", "summary": ['{"ignored": true}']},
+                {"id": "plan_1", "type": "plan", "text": '{"ignored_plan": true}'},
+                {
+                    "id": "assistant_early",
+                    "type": "agentMessage",
+                    "text": '{"status":"failed","spoken_answer":"Wrong item"}',
+                },
+            ],
+        )
+    )
+
+    messages = await worker
+
+    assert messages[-1].status == RuntimeResultStatus.COMPLETED
+    assert messages[-1].spoken_answer == "Done."
+
+
+@pytest.mark.asyncio
+async def test_codex_runtime_accepts_single_json_code_fence() -> None:
+    client = FakeClient()
+    runtime = CodexAppServerRuntime(client=client)
+    result = RuntimeResult(
+        task_id="task_codex",
+        generation=1,
+        status=RuntimeResultStatus.COMPLETED,
+        spoken_answer="Done.",
+    )
+
+    worker = asyncio.create_task(collect_results(runtime))
+    await asyncio.sleep(0)
+    await client.notifications.put(completed_turn_notification(f"```json\n{result.model_dump_json()}\n```"))
+
+    messages = await worker
+
+    assert messages[-1].status == RuntimeResultStatus.COMPLETED
+    assert messages[-1].spoken_answer == "Done."
+
+
+@pytest.mark.asyncio
+async def test_codex_runtime_does_not_scan_noisy_final_text_for_json() -> None:
+    client = FakeClient()
+    runtime = CodexAppServerRuntime(client=client)
+
+    worker = asyncio.create_task(collect_results(runtime))
+    await asyncio.sleep(0)
+    await client.notifications.put(
+        completed_turn_notification(
+            (
+                'Here is the result: {"task_id":"task_codex","generation":1,'
+                '"status":"completed","spoken_answer":"Done.","technical_summary":"ok",'
+                '"sources_or_tools_used":[]} Extra diagnostic: {"ignored": true}'
+            )
+        )
     )
 
     messages = await worker
@@ -229,24 +326,14 @@ async def test_codex_runtime_steers_active_turn_for_amendment() -> None:
         RuntimeAmendment(task_id="task_codex", generation=2, amendment="Actually use Kolkata.")
     )
     await client.notifications.put(
-        {
-            "method": "agentMessage/delta",
-            "params": {
-                "threadId": "thread_1",
-                "turnId": "turn_1",
-                "delta": json.dumps(
-                    RuntimeResult(
-                        task_id="task_codex",
-                        generation=1,
-                        status=RuntimeResultStatus.COMPLETED,
-                        spoken_answer="Done.",
-                    ).model_dump(mode="json")
-                ),
-            },
-        }
-    )
-    await client.notifications.put(
-        {"method": "turn/completed", "params": {"threadId": "thread_1", "turnId": "turn_1", "turn": {"id": "turn_1"}}}
+        completed_turn_notification(
+            RuntimeResult(
+                task_id="task_codex",
+                generation=1,
+                status=RuntimeResultStatus.COMPLETED,
+                spoken_answer="Done.",
+            ).model_dump_json()
+        )
     )
     await worker
 

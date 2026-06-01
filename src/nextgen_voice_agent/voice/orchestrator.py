@@ -16,6 +16,7 @@ from nextgen_voice_agent.config import get_settings
 from nextgen_voice_agent.models.runtime import RuntimeResult, RuntimeResultStatus
 from nextgen_voice_agent.models.task import AmendTaskRequest, CancelTaskRequest, StartTaskRequest, TaskStatus
 from nextgen_voice_agent.models.voice import VoiceEvent, VoiceEventType, VoiceTransportKind
+from nextgen_voice_agent.voice.llm_router import BRAIN_GLITCH_MESSAGE
 from nextgen_voice_agent.voice.stt import (
     AsrMode,
     SttProvider,
@@ -44,13 +45,9 @@ NATIVE_TOOL_NAMES = {
     "cancel_background_task",
 }
 
-GENERIC_TOOL_ACKS = {
-    "",
-    "I'll start that now.",
-    "I'll look into that.",
-    "I will start that now.",
-    "Done.",
-}
+USER_TURN_FOLLOWUP_INSTRUCTION = "User just spoke. Latest tool result is in history. Say the reply."
+BACKGROUND_RESEARCH_INSTRUCTION = "Background research finished; result is in history. Say the reply."
+BACKGROUND_TIMER_INSTRUCTION = "Timer completed; facts are in state/history. Say the reply."
 
 
 class VoiceTurnState(StrEnum):
@@ -59,6 +56,27 @@ class VoiceTurnState(StrEnum):
     ASSISTANT_SPEAKING = "assistant_speaking"
     BARGE_IN_CANDIDATE = "barge_in_candidate"
     POST_TTS_COOLDOWN = "post_tts_cooldown"
+
+
+class ActiveVadClassification(StrEnum):
+    NO_TRANSCRIPT = "no_transcript"
+    ECHO_LIKE = "echo_like"
+    DIVERGENT_TEXT = "divergent_text"
+
+
+class PostVadClassification(StrEnum):
+    NO_TRANSCRIPT = "no_transcript"
+    ECHO = "echo"
+    WEAK = "weak"
+    GENUINE = "genuine"
+
+
+@dataclass
+class InterruptCandidate:
+    text: str = ""
+    source: str = "none"
+    last_active_vad_classification: ActiveVadClassification = ActiveVadClassification.NO_TRANSCRIPT
+    last_stt_confidence: float | None = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +102,12 @@ class VoiceTimingConfig:
     turn_commit_active_task_wait_ms: int = 1300
     turn_commit_hard_command_wait_ms: int = 0
     turn_commit_max_pending_wait_ms: int = 2500
+    vad_investigation_max_ms: int = 900
+    echo_validation_ms: int = 400
+    post_vad_buffer_ms: int = 400
+    min_interrupt_words: int = 2
+    min_interrupt_chars: int = 6
+    response_lead_in_ms: int = 0
 
 
 @dataclass
@@ -196,6 +220,18 @@ class VoiceSessionState:
     outbound: asyncio.Queue[VoiceEvent] = field(default_factory=asyncio.Queue)
     loop_task: asyncio.Task[None] | None = None
     processed_segment_ids: set[str] = field(default_factory=set)
+    utterance_open: bool = False
+    finalizing_utterance: bool = False
+    assistant_audio_paused_for_interrupt: bool = False
+    interrupt_investigation_active: bool = False
+    non_echo_speech_detected_during_investigation: bool = False
+    echo_like_detected_at: datetime | None = None
+    transcript_seen_during_investigation: bool = False
+    vad_investigation_expires_at: datetime | None = None
+    post_vad_buffer_expires_at: datetime | None = None
+    post_vad_commit_pending: bool = False
+    post_vad_commit_text: str = ""
+    interrupt_candidate: InterruptCandidate = field(default_factory=InterruptCandidate)
 
 
 class VoiceSessionOrchestrator:
@@ -257,16 +293,16 @@ class VoiceSessionOrchestrator:
             state.candidate_speech_started_at = now
             state.candidate_speech_ended_at = None
             state.pause_resume_timer_expires_at = None
-            if state.assistant_speaking:
-                state.voice_state = VoiceTurnState.BARGE_IN_CANDIDATE
-                state.playback_paused = True
-                await self._emit(state, VoiceEventType.PAUSE_ASSISTANT_AUDIO, "Pausing assistant audio")
-            else:
-                state.voice_state = VoiceTurnState.USER_SPEAKING
+            state.utterance_open = True
             segment_id = str(event.metadata.get("speech_segment_id") or f"{session_id}-{int(self.clock().timestamp() * 1000)}")
             state.active_utterance = UtteranceBuffer(segment_id)
             state.active_asr_mode = self.effective_asr_mode
             state.active_asr_stream = await self._start_asr_stream(state, segment_id)
+            if state.assistant_speaking or state.assistant_audio_paused_for_interrupt:
+                state.voice_state = VoiceTurnState.BARGE_IN_CANDIDATE
+                await self._start_interrupt_investigation(state)
+            else:
+                state.voice_state = VoiceTurnState.USER_SPEAKING
             return
 
         if event.event == VoiceEventType.USER_TURN_AUDIO:
@@ -276,13 +312,15 @@ class VoiceSessionOrchestrator:
         if event.event == VoiceEventType.SPEECH_ENDED:
             state.user_speaking = False
             state.candidate_speech_ended_at = self.clock()
-            if state.playback_paused:
-                state.pause_resume_timer_expires_at = self.clock() + timedelta(milliseconds=self.timing.barge_in_min_speech_ms)
+            if state.interrupt_investigation_active:
+                state.post_vad_commit_pending = True
+                state.post_vad_buffer_expires_at = self.clock() + timedelta(milliseconds=self.timing.post_vad_buffer_ms)
             await self._finalize_utterance(state)
-            if state.voice_state == VoiceTurnState.USER_SPEAKING:
+            if state.interrupt_investigation_active:
+                if state.voice_state == VoiceTurnState.BARGE_IN_CANDIDATE and state.assistant_speaking:
+                    state.voice_state = VoiceTurnState.ASSISTANT_SPEAKING
+            elif state.voice_state == VoiceTurnState.USER_SPEAKING:
                 state.voice_state = VoiceTurnState.LISTENING
-            elif state.voice_state == VoiceTurnState.BARGE_IN_CANDIDATE and state.assistant_speaking:
-                state.voice_state = VoiceTurnState.ASSISTANT_SPEAKING
             return
 
         if event.event == VoiceEventType.ASSISTANT_SPEECH_STARTED:
@@ -377,6 +415,7 @@ class VoiceSessionOrchestrator:
         return self.timing.turn_commit_default_wait_ms
 
     async def _handle_user_turn(self, state: VoiceSessionState, text: str) -> None:
+        self._clear_interrupt_investigation(state)
         state.last_user_turn_at = self.clock()
 
         # A new user turn invalidates any result that was sitting in the delivery queue
@@ -407,23 +446,21 @@ class VoiceSessionOrchestrator:
         args = decision.get("arguments", {})
         
         if tool_name == "start_task":
+            task_text = args.get("task", text)
+            tool_call_id = f"call_start_{int(self.clock().timestamp() * 1000)}"
             try:
-                task_text = args.get("task", text)
-                assistant_response = (decision.get("assistant_response") or "").strip() or "I'll start that now."
                 if self._has_active_codex_task(state):
                     conflict = self._codex_task_conflict_payload(state, str(task_text))
+                    self._append_history(state, "assistant", None, extra={
+                        "role": "assistant",
+                        "tool_calls": [{"id": tool_call_id, "type": "function", "function": {"name": "start_task", "arguments": json.dumps(args)}}],
+                    })
                     self._append_history(state, "tool", json.dumps(conflict), extra={
                         "role": "tool",
-                        "tool_call_id": f"call_conflict_{int(self.clock().timestamp() * 1000)}",
+                        "tool_call_id": tool_call_id,
                         "name": "start_task",
                     })
-                    response_text = await self._compose_control_answer(
-                        state,
-                        text,
-                        "codex_task_conflict",
-                        conflict,
-                        str(conflict["message"]),
-                    )
+                    response_text = await self._speak_user_turn_followup(state, text)
                     self._append_history(state, "assistant", response_text)
                     await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, response_text, task_id=state.active_task_id)
                     return
@@ -431,15 +468,6 @@ class VoiceSessionOrchestrator:
                 logging.info("Voice router starting task with grounded request: %s", task_text)
                 logging.debug("Voice task context for Codex:\n%s", context)
                 response = await self.controller.start_task(StartTaskRequest(task=task_text, context=context))
-                if assistant_response in GENERIC_TOOL_ACKS:
-                    assistant_response = await self._compose_control_answer(
-                        state,
-                        text,
-                        "start_task_acknowledgement",
-                        response.model_dump(mode="json"),
-                        response.acknowledgement,
-                    )
-                
                 state.active_task_id = response.task.task_id
                 state.task_started_at = self.clock()
                 state.last_progress_spoken_at = None
@@ -449,100 +477,107 @@ class VoiceSessionOrchestrator:
                 state.last_progress_message = None
                 state.last_task_status_seen = response.task.user_visible_status
                 state.delivered_result_generation = None
-                
+                tool_call_id = f"call_{state.active_task_id}"
                 self._append_history(state, "assistant", None, extra={
-                    "role": "assistant", 
-                    "tool_calls": [{"id": f"call_{state.active_task_id}", "type": "function", "function": {"name": "start_task", "arguments": json.dumps(args)}}]
+                    "role": "assistant",
+                    "tool_calls": [{"id": tool_call_id, "type": "function", "function": {"name": "start_task", "arguments": json.dumps(args)}}],
                 })
                 self._append_history(state, "tool", json.dumps(response.model_dump(mode="json")), extra={
                     "role": "tool",
-                    "tool_call_id": f"call_{state.active_task_id}",
+                    "tool_call_id": tool_call_id,
                     "name": "start_task",
                 })
-                self._append_history(state, "assistant", assistant_response)
-                
-                await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, assistant_response, task_id=state.active_task_id)
+                response_text = await self._speak_user_turn_followup(state, text)
+                self._append_history(state, "assistant", response_text)
+                await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, response_text, task_id=state.active_task_id)
             except TaskConflictError as exc:
                 conflict = self._codex_task_conflict_payload(state, str(args.get("task", text)))
                 conflict["details"] = str(exc)
+                self._append_history(state, "assistant", None, extra={
+                    "role": "assistant",
+                    "tool_calls": [{"id": tool_call_id, "type": "function", "function": {"name": "start_task", "arguments": json.dumps(args)}}],
+                })
                 self._append_history(state, "tool", json.dumps(conflict), extra={
                     "role": "tool",
-                    "tool_call_id": f"call_conflict_{int(self.clock().timestamp() * 1000)}",
+                    "tool_call_id": tool_call_id,
                     "name": "start_task",
                 })
-                response_text = await self._compose_control_answer(
-                    state,
-                    text,
-                    "codex_task_conflict",
-                    conflict,
-                    str(conflict["message"]),
-                )
+                response_text = await self._speak_user_turn_followup(state, text)
                 self._append_history(state, "assistant", response_text)
                 await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, response_text, task_id=state.active_task_id)
-                
+            except Exception as exc:
+                await self._emit_tool_failure_response(state, text, "start_task", tool_call_id, exc, args)
+
         elif tool_name == "amend_task":
             task_id = args.get("task_id")
             amendment = args.get("amendment")
-            if task_id and amendment:
-                try:
-                    status = await self.controller.amend_task(task_id, AmendTaskRequest(amendment=amendment))
-                    msg = await self._compose_control_answer(
-                        state,
-                        text,
-                        "amend_task",
-                        status.model_dump(mode="json"),
-                        "I updated that task.",
-                    )
-                    self._append_history(state, "assistant", None, extra={
-                        "role": "assistant", 
-                        "tool_calls": [{"id": f"call_{task_id}_amend", "type": "function", "function": {"name": "amend_task", "arguments": json.dumps(args)}}]
-                    })
-                    self._append_history(state, "tool", json.dumps(status.model_dump(mode="json")), extra={
-                        "role": "tool",
-                        "tool_call_id": f"call_{task_id}_amend",
-                        "name": "amend_task",
-                    })
-                    self._append_history(state, "assistant", msg)
-                    await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, msg, task_id=task_id)
-                except Exception as exc:
-                    await self._emit(state, VoiceEventType.ERROR, str(exc))
-            else:
-                await self._emit(state, VoiceEventType.ERROR, "Missing task_id or amendment for amend_task")
-                
+            tool_call_id = f"call_{task_id or 'unknown'}_amend_{int(self.clock().timestamp() * 1000)}"
+            if not task_id or not amendment:
+                await self._emit_tool_failure_response(
+                    state,
+                    text,
+                    "amend_task",
+                    tool_call_id,
+                    ValueError("Missing task_id or amendment for amend_task"),
+                    args,
+                )
+                return
+            try:
+                status = await self.controller.amend_task(task_id, AmendTaskRequest(amendment=amendment))
+                self._append_history(state, "assistant", None, extra={
+                    "role": "assistant",
+                    "tool_calls": [{"id": tool_call_id, "type": "function", "function": {"name": "amend_task", "arguments": json.dumps(args)}}],
+                })
+                self._append_history(state, "tool", json.dumps(status.model_dump(mode="json")), extra={
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "name": "amend_task",
+                })
+                msg = await self._speak_user_turn_followup(state, text)
+                self._append_history(state, "assistant", msg)
+                await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, msg, task_id=task_id)
+            except Exception as exc:
+                await self._emit_tool_failure_response(state, text, "amend_task", tool_call_id, exc, args)
+
         elif tool_name == "cancel_task":
             task_id = args.get("task_id")
-            if task_id:
-                try:
-                    response = await self.controller.cancel_task(task_id, CancelTaskRequest(reason="User voice cancellation"))
-                    msg = await self._compose_control_answer(
-                        state,
-                        text,
-                        "cancel_task",
-                        response.model_dump(mode="json"),
-                        "I stopped that task.",
-                    )
-                    self._append_history(state, "assistant", None, extra={
-                        "role": "assistant", 
-                        "tool_calls": [{"id": f"call_{task_id}_cancel", "type": "function", "function": {"name": "cancel_task", "arguments": json.dumps(args)}}]
-                    })
-                    self._append_history(state, "tool", json.dumps(response.model_dump(mode="json")), extra={
-                        "role": "tool",
-                        "tool_call_id": f"call_{task_id}_cancel",
-                        "name": "cancel_task",
-                    })
-                    self._append_history(state, "assistant", msg)
-                    await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, msg, task_id=task_id)
-                    if state.active_task_id == task_id:
-                        state.active_task_id = None
-                except Exception as exc:
-                    await self._emit(state, VoiceEventType.ERROR, str(exc))
+            tool_call_id = f"call_{task_id or 'unknown'}_cancel_{int(self.clock().timestamp() * 1000)}"
+            if not task_id:
+                await self._emit_tool_failure_response(
+                    state,
+                    text,
+                    "cancel_task",
+                    tool_call_id,
+                    ValueError("Missing task_id for cancel_task"),
+                    args,
+                )
+                return
+            try:
+                response = await self.controller.cancel_task(task_id, CancelTaskRequest(reason="User voice cancellation"))
+                self._append_history(state, "assistant", None, extra={
+                    "role": "assistant",
+                    "tool_calls": [{"id": tool_call_id, "type": "function", "function": {"name": "cancel_task", "arguments": json.dumps(args)}}],
+                })
+                self._append_history(state, "tool", json.dumps(response.model_dump(mode="json")), extra={
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "name": "cancel_task",
+                })
+                msg = await self._speak_user_turn_followup(state, text)
+                self._append_history(state, "assistant", msg)
+                await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, msg, task_id=task_id)
+                if state.active_task_id == task_id:
+                    state.active_task_id = None
+            except Exception as exc:
+                await self._emit_tool_failure_response(state, text, "cancel_task", tool_call_id, exc, args)
+
         elif isinstance(tool_name, str) and tool_name in NATIVE_TOOL_NAMES:
+            tool_call_id = f"call_{tool_name}_{int(self.clock().timestamp() * 1000)}"
             try:
                 result = await self._execute_native_tool(state, tool_name, args)
             except Exception as exc:
-                await self._emit(state, VoiceEventType.ERROR, str(exc))
+                await self._emit_tool_failure_response(state, text, tool_name, tool_call_id, exc, args)
                 return
-            tool_call_id = f"call_{tool_name}_{int(self.clock().timestamp() * 1000)}"
             self._append_history(state, "assistant", None, extra={
                 "role": "assistant",
                 "tool_calls": [{"id": tool_call_id, "type": "function", "function": {"name": tool_name, "arguments": json.dumps(args)}}],
@@ -552,23 +587,7 @@ class VoiceSessionOrchestrator:
                 "tool_call_id": tool_call_id,
                 "name": tool_name,
             })
-            assistant_response = (decision.get("assistant_response") or "").strip()
-            if result.get("ok") is False:
-                assistant_response = await self._compose_native_tool_answer(
-                    state,
-                    text,
-                    tool_name,
-                    result,
-                    "That completion does not match the tracked activity yet.",
-                )
-            elif assistant_response in GENERIC_TOOL_ACKS:
-                assistant_response = await self._compose_native_tool_answer(
-                    state,
-                    text,
-                    tool_name,
-                    result,
-                    str(result.get("message") or "Done.").strip() or "Done.",
-                )
+            assistant_response = await self._speak_user_turn_followup(state, text)
             self._append_history(state, "assistant", assistant_response)
             await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, assistant_response, task_id=state.active_task_id)
                     
@@ -591,43 +610,48 @@ class VoiceSessionOrchestrator:
 
     async def _finalize_utterance(self, state: VoiceSessionState) -> None:
         if state.active_utterance is None:
+            state.utterance_open = False
             return
         segment_id = state.active_utterance.speech_segment_id
         frames = state.active_utterance.finalize()
         state.active_utterance = None
-        if not frames or self.stt_provider is None:
-            return
-        if state.active_asr_stream is not None:
-            stream = state.active_asr_stream
-            state.active_asr_stream = None
-            try:
-                await self._handle_transcript_event(state, await stream.commit())
-                return
-            except Exception as e:
-                logging.debug(f"Streaming transcription failed (likely background noise): {e}")
+        state.finalizing_utterance = True
         try:
-            result = await self.stt_provider.transcribe_utterance(frames)
-        except Exception as e:
-            logging.debug(f"Utterance transcription failed (likely background noise): {e}")
-            return
-        transcript = result.text.strip()
-        if not transcript:
-            return
-        if segment_id in state.processed_segment_ids:
-            return
-        state.processed_segment_ids.add(segment_id)
-        state.last_transcript = transcript
-        candidate = self._validate_asr_candidate(state, transcript, segment_id)
-        await self._emit_transcript_final(state, transcript, {"provider": result.provider, **result.metadata}, candidate)
-        if candidate.status != "accepted":
-            return
-        if candidate.during_assistant_speech or candidate.during_cooldown:
-            await self._stop_assistant_audio(state)
-        
-        state.pending_transcript = f"{state.pending_transcript} {transcript}".strip()
-        state.pending_transcript_since = self.clock()
-        if self._classify_commit_delay(state) == 0:
-            await self._maybe_commit_turn(state)
+            if not frames or self.stt_provider is None:
+                return
+            if state.active_asr_stream is not None:
+                stream = state.active_asr_stream
+                state.active_asr_stream = None
+                try:
+                    await self._handle_transcript_event(state, await stream.commit(), authoritative=True)
+                    return
+                except Exception as e:
+                    logging.debug(f"Streaming transcription failed (likely background noise): {e}")
+            try:
+                result = await self.stt_provider.transcribe_utterance(frames)
+            except Exception as e:
+                logging.debug(f"Utterance transcription failed (likely background noise): {e}")
+                return
+            transcript = result.text.strip()
+            if not transcript:
+                return
+            if segment_id in state.processed_segment_ids:
+                return
+            await self._handle_transcript_event(
+                state,
+                SttTranscriptEvent(
+                    event=SttTranscriptEventType.FINAL,
+                    text=transcript,
+                    segment_id=segment_id,
+                    confidence=result.confidence,
+                    provider=result.provider,
+                    metadata=result.metadata,
+                ),
+                authoritative=True,
+            )
+        finally:
+            state.finalizing_utterance = False
+            state.utterance_open = False
 
     async def _start_asr_stream(self, state: VoiceSessionState, segment_id: str) -> SttStream | None:
         if self.stt_provider is None or self.effective_asr_mode != AsrMode.SPEECH_GATED_STREAMING:
@@ -644,10 +668,19 @@ class VoiceSessionOrchestrator:
             state.active_asr_mode = AsrMode.UTTERANCE_BATCH
             return None
 
-    async def _handle_transcript_event(self, state: VoiceSessionState, event: SttTranscriptEvent) -> None:
+    async def _handle_transcript_event(
+        self,
+        state: VoiceSessionState,
+        event: SttTranscriptEvent,
+        *,
+        authoritative: bool = False,
+    ) -> None:
         if state.active_utterance and event.segment_id != state.active_utterance.speech_segment_id:
-            return
+            if not authoritative:
+                return
         transcript = event.text.strip()
+        is_authoritative = authoritative or state.finalizing_utterance or not state.utterance_open
+
         if event.event == SttTranscriptEventType.PARTIAL:
             if not transcript:
                 return
@@ -658,7 +691,9 @@ class VoiceSessionOrchestrator:
                 transcript,
                 metadata={"provider": event.provider, "confidence": event.confidence, **event.metadata},
             )
-            await self._maybe_cancel_from_partial(state, transcript, event.confidence)
+            if state.interrupt_investigation_active:
+                self._update_active_vad_candidate(state, transcript, "partial", event.confidence)
+                await self._maybe_resume_interrupt_investigation(state)
             return
 
         if event.event == SttTranscriptEventType.ERROR:
@@ -668,56 +703,54 @@ class VoiceSessionOrchestrator:
         if event.event == SttTranscriptEventType.FINAL:
             if not transcript:
                 return
-            if event.segment_id in state.processed_segment_ids:
+            if is_authoritative:
+                if event.segment_id in state.processed_segment_ids:
+                    return
+                state.processed_segment_ids.add(event.segment_id)
+                state.last_transcript = transcript
+                candidate = self._validate_asr_candidate(state, transcript, event.segment_id)
+                await self._emit_transcript_final(
+                    state,
+                    transcript,
+                    {"provider": event.provider, "confidence": event.confidence, **event.metadata},
+                    candidate,
+                )
+                if state.interrupt_investigation_active and state.post_vad_commit_pending:
+                    state.post_vad_commit_text = transcript
+                    state.interrupt_candidate = InterruptCandidate(
+                        text=transcript,
+                        source="commit_final",
+                        last_active_vad_classification=state.interrupt_candidate.last_active_vad_classification,
+                        last_stt_confidence=event.confidence,
+                    )
+                    return
+                if candidate.status != "accepted":
+                    return
+                await self._apply_authoritative_user_transcript(state, transcript)
                 return
-            state.processed_segment_ids.add(event.segment_id)
-            state.last_transcript = transcript
-            candidate = self._validate_asr_candidate(state, transcript, event.segment_id)
-            await self._emit_transcript_final(
-                state,
-                transcript,
-                {"provider": event.provider, "confidence": event.confidence, **event.metadata},
-                candidate,
-            )
-            if candidate.status != "accepted":
-                return
-            if candidate.during_assistant_speech or candidate.during_cooldown:
-                await self._stop_assistant_audio(state)
-            
-            state.pending_transcript = f"{state.pending_transcript} {transcript}".strip()
-            state.pending_transcript_since = self.clock()
-            if self._classify_commit_delay(state) == 0:
-                await self._maybe_commit_turn(state)
 
-    async def _maybe_cancel_from_partial(self, state: VoiceSessionState, transcript: str, confidence: float | None) -> None:
-        if confidence is not None and confidence < 0.75:
-            return
-        normalized = transcript.strip().lower().rstrip(".!")
-        cancellation_phrases = {"stop", "stop that", "cancel", "cancel that", "never mind", "pause", "don't do that"}
-        if normalized not in cancellation_phrases:
-            return
-        if self._matches_recent_assistant_text(state, _normalize_turn_text(transcript)):
-            return
-        if state.assistant_speaking:
-            await self._stop_assistant_audio(state)
-        if state.active_task_id:
-            task_id = state.active_task_id
-            response = await self.controller.cancel_task(task_id, CancelTaskRequest(reason=f"Partial voice cancellation: {transcript}"))
-            reply = await self._compose_control_answer(
+            state.last_transcript = transcript
+            await self._emit(
                 state,
+                VoiceEventType.TRANSCRIPT_FINAL,
                 transcript,
-                "cancel_task",
-                response.model_dump(mode="json"),
-                "I stopped that task.",
+                metadata={
+                    "provider": event.provider,
+                    "confidence": event.confidence,
+                    "provisional": True,
+                    **event.metadata,
+                },
             )
-            self._append_history(state, "tool", json.dumps(response.model_dump(mode="json")), extra={
-                "role": "tool",
-                "tool_call_id": f"call_{task_id}_partial_cancel",
-                "name": "cancel_task",
-            })
-            self._append_history(state, "assistant", reply)
-            await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, reply, task_id=task_id)
-            state.active_task_id = None
+            if state.interrupt_investigation_active:
+                self._update_active_vad_candidate(state, transcript, "stream_final", event.confidence)
+                await self._maybe_resume_interrupt_investigation(state)
+            return
+
+    async def _apply_authoritative_user_transcript(self, state: VoiceSessionState, transcript: str) -> None:
+        state.pending_transcript = f"{state.pending_transcript} {transcript}".strip()
+        state.pending_transcript_since = self.clock()
+        if self._classify_commit_delay(state) == 0:
+            await self._maybe_commit_turn(state)
 
     async def _control_loop(self, state: VoiceSessionState) -> None:
         interval = self.timing.control_loop_ms / 1000
@@ -725,6 +758,7 @@ class VoiceSessionOrchestrator:
             while not state.stopped:
                 await asyncio.sleep(interval)
                 await self._advance_turn_state(state)
+                await self._advance_interrupt_investigation(state)
                 await self._maybe_commit_turn(state)
                 await self._poll_task_result(state)
                 await self._maybe_deliver_timer_alert(state)
@@ -760,25 +794,11 @@ class VoiceSessionOrchestrator:
         if meaningful_progress:
             state.last_task_status_seen = task.user_visible_status
 
-        if not meaningful_progress and state.next_progress_check_at is not None and now < state.next_progress_check_at:
+        if state.next_progress_check_at is not None and now < state.next_progress_check_at:
             return
 
         state.progress_check_count += 1
-        decision = await self._decide_progress_action(state, task, meaningful_progress)
-        next_check_ms = decision.get("next_check_ms") if isinstance(decision, dict) else None
-        state.next_progress_check_at = now + timedelta(milliseconds=self._normalize_next_progress_check(next_check_ms))
-        if not isinstance(decision, dict):
-            return
-        action = str(decision.get("action") or "stay_silent").lower()
-        message = (decision.get("message") or "").strip()
-        if action != "speak_progress" or not message:
-            return
-        if message == state.last_progress_message:
-            return
-        state.last_progress_message = message
-        state.last_progress_spoken_at = now
-        state.progress_update_count += 1
-        await self._emit(state, VoiceEventType.TASK_STATUS, message, task_id=state.active_task_id)
+        state.next_progress_check_at = now + timedelta(milliseconds=self._normalize_next_progress_check(None))
 
     async def _maybe_deliver_timer_alert(self, state: VoiceSessionState) -> None:
         if state.user_speaking or state.assistant_speaking:
@@ -786,7 +806,7 @@ class VoiceSessionOrchestrator:
         record = self._next_pending_timer_delivery(state)
         if record is None:
             return
-        answer = await self._compose_runtime_event_answer(state, record)
+        answer = await self._speak_background_event(state, record.original_request, BACKGROUND_TIMER_INSTRUCTION)
         record.status = "speaking"
         record.text = answer
         self._append_history(state, "assistant", answer)
@@ -817,19 +837,6 @@ class VoiceSessionOrchestrator:
     def _has_pending_timer_delivery(self, state: VoiceSessionState) -> bool:
         return self._next_pending_timer_delivery(state) is not None
 
-    async def _decide_progress_action(self, state: VoiceSessionState, task: Any, meaningful_progress: bool) -> dict[str, Any]:
-        decider = getattr(self.llm_provider, "decide_progress", None)
-        if callable(decider):
-            try:
-                decision = await decider(self._build_progress_state(state, task, meaningful_progress), state.conversation_history)
-                if isinstance(decision, dict):
-                    return decision
-            except Exception as exc:
-                logging.error(f"Error deciding progress action: {exc}")
-        if meaningful_progress and task.user_visible_status != state.last_progress_message:
-            return {"action": "speak_progress", "message": task.user_visible_status, "next_check_ms": None}
-        return {"action": "stay_silent", "message": None, "next_check_ms": None}
-
     def _normalize_next_progress_check(self, next_check_ms: object) -> int:
         if isinstance(next_check_ms, int | float) and next_check_ms > 0:
             return int(next_check_ms)
@@ -852,10 +859,11 @@ class VoiceSessionOrchestrator:
         if state.delivered_result_generation == result.generation:
             return
 
-        answer = await self._compose_delivery_answer(state, result)
         self._append_tool_result_history(state, result)
-        self._append_history(state, "assistant", answer)
         task = self.controller.tasks.get(result.task_id)
+        user_text = task.original_request if task else result.task_id
+        answer = await self._speak_background_event(state, user_text, BACKGROUND_RESEARCH_INSTRUCTION)
+        self._append_history(state, "assistant", answer)
         delivery = self._create_delivery_record(
             state,
             delivery_id=f"delivery_{result.task_id}_{result.generation}",
@@ -890,104 +898,80 @@ class VoiceSessionOrchestrator:
         state.queued_result = None
         state.active_task_id = None
 
-    async def _compose_delivery_answer(self, state: VoiceSessionState, result: RuntimeResult) -> str:
-        fallback = result.spoken_answer or result.error or "The task finished without a spoken answer."
-        if result.status == RuntimeResultStatus.COMPLETED:
-            fallback = f"I have the result now. {fallback}"
+    async def _speak_user_turn_followup(self, state: VoiceSessionState, user_text: str) -> str:
+        return await self._speak_from_state(state, USER_TURN_FOLLOWUP_INSTRUCTION, user_text)
 
-        composer = getattr(self.llm_provider, "compose_tool_result", None)
-        if not callable(composer):
-            return fallback
+    async def _speak_background_event(
+        self,
+        state: VoiceSessionState,
+        user_text: str | None,
+        instruction: str,
+    ) -> str:
+        return await self._speak_from_state(state, instruction, user_text)
 
-        sys_state = f"Completed Task ID: {result.task_id}\nCompleted Task Status: {result.status.value}"
-        task = self.controller.tasks.get(result.task_id)
-        user_text = task.original_request if task else result.task_id
+    async def _speak_from_state(
+        self,
+        state: VoiceSessionState,
+        instruction: str,
+        user_text: str | None,
+    ) -> str:
+        speaker = getattr(self.llm_provider, "speak_from_state", None)
+        if not callable(speaker):
+            raise RuntimeError("speak_from_state is not available on llm_provider")
         try:
-            composed = await composer(
+            return await speaker(
+                instruction,
                 user_text,
-                sys_state,
+                self._build_system_state(state),
                 state.conversation_history,
-                result,
             )
         except Exception as exc:
-            logging.error(f"Error composing delivery answer: {exc}")
-            return fallback
-        return (composed or "").strip() or fallback
+            logging.error("speak_from_state failed: %s", exc)
+            return BRAIN_GLITCH_MESSAGE
 
-    async def _compose_native_tool_answer(
+    def _tool_failure_payload(self, exc: Exception | str, tool_name: str) -> dict[str, Any]:
+        message = str(exc)
+        return {
+            "ok": False,
+            "message": message,
+            "error_code": type(exc).__name__ if isinstance(exc, Exception) else "tool_failure",
+            "recoverable": True,
+            "tool_name": tool_name,
+            "allowed_next_actions": [],
+        }
+
+    def _record_tool_failure(
+        self,
+        state: VoiceSessionState,
+        tool_name: str,
+        tool_call_id: str,
+        exc: Exception | str,
+        args: dict[str, Any],
+    ) -> None:
+        payload = self._tool_failure_payload(exc, tool_name)
+        self._append_history(state, "assistant", None, extra={
+            "role": "assistant",
+            "tool_calls": [{"id": tool_call_id, "type": "function", "function": {"name": tool_name, "arguments": json.dumps(args)}}],
+        })
+        self._append_history(state, "tool", json.dumps(payload), extra={
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "name": tool_name,
+        })
+
+    async def _emit_tool_failure_response(
         self,
         state: VoiceSessionState,
         user_text: str,
         tool_name: str,
-        result: dict[str, Any],
-        fallback: str,
-    ) -> str:
-        composer = getattr(self.llm_provider, "compose_native_tool_result", None)
-        if not callable(composer):
-            return fallback
-        try:
-            composed = await composer(
-                user_text,
-                self._build_system_state(state),
-                state.conversation_history,
-                tool_name,
-                result,
-                fallback,
-            )
-        except Exception as exc:
-            logging.error(f"Error composing native tool answer: {exc}")
-            return fallback
-        return (composed or "").strip() or fallback
-
-    async def _compose_runtime_event_answer(self, state: VoiceSessionState, record: DeliveryRecord) -> str:
-        composer = getattr(self.llm_provider, "compose_runtime_event_result", None)
-        if not callable(composer):
-            return record.text
-        event_payload = next(
-            (
-                event
-                for event in reversed(state.recent_completed_events)
-                if event.get("delivery_id") == record.delivery_id
-            ),
-            {"type": record.kind, "delivery_id": record.delivery_id},
-        )
-        try:
-            composed = await composer(
-                self._build_system_state(state),
-                state.conversation_history,
-                self._delivery_payload(record),
-                event_payload,
-                record.text,
-            )
-        except Exception as exc:
-            logging.error(f"Error composing runtime event answer: {exc}")
-            return record.text
-        return (composed or "").strip() or record.text
-
-    async def _compose_control_answer(
-        self,
-        state: VoiceSessionState,
-        user_text: str,
-        action_name: str,
-        payload: dict[str, Any],
-        fallback: str,
-    ) -> str:
-        composer = getattr(self.llm_provider, "compose_control_result", None)
-        if not callable(composer):
-            return fallback
-        try:
-            composed = await composer(
-                user_text,
-                self._build_system_state(state),
-                state.conversation_history,
-                action_name,
-                payload,
-                fallback,
-            )
-        except Exception as exc:
-            logging.error(f"Error composing control answer: {exc}")
-            return fallback
-        return (composed or "").strip() or fallback
+        tool_call_id: str,
+        exc: Exception | str,
+        args: dict[str, Any],
+    ) -> None:
+        self._record_tool_failure(state, tool_name, tool_call_id, exc, args)
+        response_text = await self._speak_user_turn_followup(state, user_text)
+        self._append_history(state, "assistant", response_text)
+        await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, response_text, task_id=state.active_task_id)
 
     def _append_tool_result_history(self, state: VoiceSessionState, result: RuntimeResult) -> None:
         tool_call_id = f"result_{result.task_id}"
@@ -1202,21 +1186,6 @@ class VoiceSessionOrchestrator:
             "last_spoken_update_ms_ago": int(self._elapsed_ms(state.last_progress_spoken_at)) if state.last_progress_spoken_at else None,
             "progress_update_count": state.progress_update_count,
             "ui_title": getattr(task, "ui_title", None),
-        }
-
-    def _build_progress_state(self, state: VoiceSessionState, task: Any, meaningful_progress: bool) -> dict[str, Any]:
-        now = self.clock()
-        return {
-            "current_time": self._iso_now(),
-            "task": self._task_payload(state, task, now),
-            "conversation_state": {
-                "user_speaking": state.user_speaking,
-                "assistant_speaking": state.assistant_speaking,
-                "user_last_spoke_ms_ago": int(self._elapsed_ms(state.last_user_turn_at)) if state.last_user_turn_at else None,
-                "last_agent_message": self._last_assistant_message(state),
-            },
-            "meaningful_progress": meaningful_progress,
-            "instruction": "Decide whether the agent should speak now or stay silent.",
         }
 
     async def _execute_native_tool(self, state: VoiceSessionState, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -1481,16 +1450,146 @@ class VoiceSessionOrchestrator:
             state.assistant_speaking = False
         state.playback_paused = False
         state.pause_resume_timer_expires_at = None
+        self._clear_interrupt_investigation(state)
         state.voice_state = VoiceTurnState.USER_SPEAKING if state.user_speaking else VoiceTurnState.LISTENING
         state.post_tts_cooldown_expires_at = None
         await self._emit(state, VoiceEventType.STOP_ASSISTANT_AUDIO, "Stopping assistant audio.")
 
-    async def _advance_turn_state(self, state: VoiceSessionState) -> None:
-        if state.pause_resume_timer_expires_at and self.clock() >= state.pause_resume_timer_expires_at:
-            state.playback_paused = False
-            state.pause_resume_timer_expires_at = None
-            await self._emit(state, VoiceEventType.RESUME_ASSISTANT_AUDIO, "Resuming assistant audio (false alarm)")
+    async def _start_interrupt_investigation(self, state: VoiceSessionState) -> None:
+        if state.interrupt_investigation_active:
+            return
+        now = self.clock()
+        state.interrupt_investigation_active = True
+        state.assistant_audio_paused_for_interrupt = True
+        state.playback_paused = True
+        state.non_echo_speech_detected_during_investigation = False
+        state.echo_like_detected_at = None
+        state.transcript_seen_during_investigation = False
+        state.interrupt_candidate = InterruptCandidate()
+        state.vad_investigation_expires_at = now + timedelta(milliseconds=self.timing.vad_investigation_max_ms)
+        state.post_vad_commit_pending = False
+        state.post_vad_commit_text = ""
+        state.post_vad_buffer_expires_at = None
+        await self._emit(state, VoiceEventType.PAUSE_ASSISTANT_AUDIO, "Pausing assistant audio for interrupt investigation.")
 
+    def _clear_interrupt_investigation(self, state: VoiceSessionState) -> None:
+        state.interrupt_investigation_active = False
+        state.assistant_audio_paused_for_interrupt = False
+        state.playback_paused = False
+        state.non_echo_speech_detected_during_investigation = False
+        state.echo_like_detected_at = None
+        state.transcript_seen_during_investigation = False
+        state.vad_investigation_expires_at = None
+        state.post_vad_buffer_expires_at = None
+        state.post_vad_commit_pending = False
+        state.post_vad_commit_text = ""
+        state.interrupt_candidate = InterruptCandidate()
+        state.pause_resume_timer_expires_at = None
+
+    def _classify_active_vad_text(
+        self,
+        state: VoiceSessionState,
+        text: str,
+        stt_confidence: float | None,
+    ) -> ActiveVadClassification:
+        del stt_confidence
+        if not text.strip():
+            return ActiveVadClassification.NO_TRANSCRIPT
+        normalized = _normalize_turn_text(text)
+        if self._assistant_echo_reason(state, normalized):
+            return ActiveVadClassification.ECHO_LIKE
+        return ActiveVadClassification.DIVERGENT_TEXT
+
+    def _classify_post_vad_commit(self, state: VoiceSessionState, text: str) -> PostVadClassification:
+        normalized = _normalize_turn_text(text)
+        if not normalized:
+            return PostVadClassification.NO_TRANSCRIPT
+        if self._assistant_echo_reason(state, normalized):
+            return PostVadClassification.ECHO
+        if _is_hard_interrupt_command(normalized):
+            return PostVadClassification.GENUINE
+        if _passes_min_evidence(normalized, self.timing):
+            return PostVadClassification.GENUINE
+        return PostVadClassification.WEAK
+
+    def _update_active_vad_candidate(
+        self,
+        state: VoiceSessionState,
+        text: str,
+        source: str,
+        confidence: float | None,
+    ) -> None:
+        classification = self._classify_active_vad_text(state, text, confidence)
+        state.interrupt_candidate = InterruptCandidate(
+            text=text,
+            source=source,
+            last_active_vad_classification=classification,
+            last_stt_confidence=confidence,
+        )
+        if text.strip():
+            state.transcript_seen_during_investigation = True
+        if classification == ActiveVadClassification.ECHO_LIKE:
+            if state.echo_like_detected_at is None:
+                state.echo_like_detected_at = self.clock()
+        elif classification == ActiveVadClassification.DIVERGENT_TEXT:
+            state.non_echo_speech_detected_during_investigation = True
+            state.echo_like_detected_at = None
+
+    def _interrupt_resume_allowed(self, state: VoiceSessionState) -> bool:
+        if state.non_echo_speech_detected_during_investigation:
+            return False
+        if not state.transcript_seen_during_investigation:
+            return False
+        if state.echo_like_detected_at is None:
+            return False
+        return self.clock() >= state.echo_like_detected_at + timedelta(milliseconds=self.timing.echo_validation_ms)
+
+    async def _maybe_resume_interrupt_investigation(self, state: VoiceSessionState) -> None:
+        if not state.interrupt_investigation_active or state.post_vad_commit_pending:
+            return
+        if state.non_echo_speech_detected_during_investigation:
+            return
+        now = self.clock()
+        if not state.transcript_seen_during_investigation:
+            if state.vad_investigation_expires_at and now >= state.vad_investigation_expires_at:
+                await self._resume_interrupt_investigation(state)
+            return
+        if self._interrupt_resume_allowed(state):
+            await self._resume_interrupt_investigation(state)
+
+    async def _resume_interrupt_investigation(self, state: VoiceSessionState) -> None:
+        if not state.assistant_audio_paused_for_interrupt:
+            self._clear_interrupt_investigation(state)
+            return
+        await self._emit(state, VoiceEventType.RESUME_ASSISTANT_AUDIO, "Resuming assistant audio (false alarm).")
+        self._clear_interrupt_investigation(state)
+        if state.user_speaking:
+            state.voice_state = VoiceTurnState.BARGE_IN_CANDIDATE if state.assistant_speaking else VoiceTurnState.USER_SPEAKING
+        elif state.assistant_speaking:
+            state.voice_state = VoiceTurnState.ASSISTANT_SPEAKING
+
+    async def _resolve_post_vad_interrupt(self, state: VoiceSessionState) -> None:
+        text = state.post_vad_commit_text.strip()
+        classification = self._classify_post_vad_commit(state, text)
+        state.post_vad_commit_pending = False
+        state.post_vad_commit_text = ""
+        state.post_vad_buffer_expires_at = None
+        if classification == PostVadClassification.GENUINE:
+            await self._stop_assistant_audio(state)
+            if text:
+                await self._apply_authoritative_user_transcript(state, text)
+            return
+        await self._resume_interrupt_investigation(state)
+
+    async def _advance_interrupt_investigation(self, state: VoiceSessionState) -> None:
+        if not state.interrupt_investigation_active:
+            return
+        await self._maybe_resume_interrupt_investigation(state)
+        if state.post_vad_commit_pending and state.post_vad_buffer_expires_at:
+            if self.clock() >= state.post_vad_buffer_expires_at:
+                await self._resolve_post_vad_interrupt(state)
+
+    async def _advance_turn_state(self, state: VoiceSessionState) -> None:
         if state.voice_state == VoiceTurnState.POST_TTS_COOLDOWN and state.post_tts_cooldown_expires_at:
             if self.clock() >= state.post_tts_cooldown_expires_at:
                 state.voice_state = VoiceTurnState.LISTENING
@@ -1633,6 +1732,11 @@ class VoiceSessionOrchestrator:
             for item in state.recent_assistant_utterances
             if self._elapsed_ms(item[0]) <= self.timing.recent_assistant_window_ms
         ]
+
+
+def _passes_min_evidence(normalized: str, timing: VoiceTimingConfig) -> bool:
+    words = normalized.split()
+    return len(words) >= timing.min_interrupt_words or len(normalized) >= timing.min_interrupt_chars
 
 
 def _normalize_turn_text(text: str) -> str:

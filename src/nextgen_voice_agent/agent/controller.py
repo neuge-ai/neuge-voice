@@ -235,8 +235,16 @@ class AgentController:
             task = self.tasks.get(request.task_id)
             if task is None:
                 return
+            error = str(exc)
+            self.results[request.task_id] = RuntimeResult(
+                task_id=request.task_id,
+                generation=request.generation,
+                status=RuntimeResultStatus.FAILED,
+                error=error,
+                technical_summary=error,
+            )
             task.status = TaskStatus.FAILED
-            task.user_visible_status = "Task failed"
+            task.user_visible_status = error or "Task failed"
             task.touch()
             if self.active_task_id == request.task_id:
                 self.active_task_id = None
@@ -244,7 +252,7 @@ class AgentController:
                 TaskFailedEvent(
                     task_id=task.task_id,
                     generation=task.generation,
-                    error=str(exc),
+                    error=task.user_visible_status,
                 )
             )
         finally:
@@ -297,6 +305,7 @@ class AgentController:
             return
 
         if result.status == RuntimeResultStatus.FAILED:
+            self.results[task.task_id] = result
             task.status = TaskStatus.FAILED
             task.user_visible_status = result.error or "Task failed"
             task.touch()

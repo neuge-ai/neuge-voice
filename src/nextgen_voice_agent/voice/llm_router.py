@@ -5,9 +5,9 @@ from typing import Any, Literal, TypedDict
 
 from litellm import acompletion
 
-from nextgen_voice_agent.models.runtime import RuntimeResult
-
 logger = logging.getLogger(__name__)
+
+BRAIN_GLITCH_MESSAGE = "Sorry, my brain encountered a temporary glitch. Can you repeat that?"
 
 TOOL_ACTIONS = {
     "start_task",
@@ -255,7 +255,61 @@ SANITY_CHECK_INSTRUCTIONS = (
     "- Do not preserve or mention missed ephemeral status/progress filler. Only durable pending items matter.\n"
     "- Use native timer/activity/status tools for deterministic state. Use Codex only for open-ended work.\n"
     "- Keep challenges light, direct, and non-hostile.\n"
+    "- If pending_unheard_items includes unresolved failures or interrupted deliveries, mention them briefly after answering the current request when relevant.\n"
 )
+
+ROUTE_TURN_TOOL_INSTRUCTIONS = (
+    "CRITICAL INSTRUCTIONS ON TOOL USE:\n"
+    "- If the user asks to write code, search the web, check the weather, or do any complex task, YOU MUST CALL `start_task`.\n"
+    "- If the user asks to set/check/cancel timers or track/check/end activities, use the native timer/activity tools.\n"
+    "- If the user asks whether background work is done, use the provided state or native background status tools; do not guess.\n"
+    "- Only one Codex/background task may run at a time. If `can_start_new_codex_task` is false, do not call `start_task`.\n"
+    "- While Codex is running, simple conversation, timers, activities, status checks, amendments, and cancellation are still allowed.\n"
+    "- Treat related follow-ups to the active Codex task as same-thread amendments. If the user refines, narrows, corrects, adds constraints, says 'also', 'instead', 'make sure', 'use X', 'don't do Y', or otherwise refers to the current task, call `amend_task`.\n"
+    "- For amendments, pass only the new instruction or correction in `amendment`; do not rewrite the full original task.\n"
+    "- If the user asks for a clearly unrelated second complex task while Codex is running, explain that a background task is already running and ask whether to cancel/switch or keep it going.\n"
+    "- If the user clearly says to cancel the current task and do a new complex task, call `cancel_task` first; the new task can be started on the next turn after cancellation.\n"
+    "- Before calling `start_task`, inspect the conversation history and completed tool results.\n"
+    "- For follow-up requests like 'compare it with X', resolve pronouns and include relevant prior facts in `task`.\n"
+    "- If prior tool output already answers part of the request, preserve it and ask the tool only for missing/new information.\n"
+    "- If the user asks to change a running task, call `amend_task` with the active task id from system state.\n"
+    "- If a task is completed and the user asks a follow-up, call `start_task` with a self-contained task that names the prior facts and the new ask.\n"
+    "- If the user asks to stop a running task, call `cancel_task`.\n"
+    "- If no tool is needed, respond with normal assistant content.\n"
+    "- Never attempt to call a tool not explicitly listed in your schema.\n"
+)
+
+SPEAK_FROM_STATE_INSTRUCTIONS = (
+    "SPEAK MODE:\n"
+    "Produce the single next spoken reply for the user.\n"
+    "Use conversation history and system state; latest tool results in history are authoritative facts.\n"
+    "Keep the response concise, natural, and suitable for speech.\n"
+    "Do not mention internal tool names unless the user asked.\n"
+    "If a tool failed, say that it failed; do not read raw error text aloud unless the user asked for technical details.\n"
+    "Do not invent facts beyond history, state, and tool output.\n"
+)
+
+
+def build_route_turn_system_prompt(system_state: str) -> str:
+    return (
+        "You are the ultra-fast conversational Voice Shell for a powerful coding agent.\n"
+        "Your job is to manage the flow of conversation and delegate heavy work to background tasks.\n"
+        "Answer simple conversational turns directly. Use tools only when the app must start, amend, or cancel a background task.\n\n"
+        f"{ROUTE_TURN_TOOL_INSTRUCTIONS}\n"
+        f"{SANITY_CHECK_INSTRUCTIONS}\n"
+        f"Current System State:\n{system_state}\n"
+    )
+
+
+def build_speak_from_state_system_prompt(system_state: str) -> str:
+    return (
+        "You are the ultra-fast conversational Voice Shell for a powerful coding agent.\n"
+        "Your job is to manage the flow of conversation and delegate heavy work to background tasks.\n\n"
+        f"{SPEAK_FROM_STATE_INSTRUCTIONS}\n"
+        f"{SANITY_CHECK_INSTRUCTIONS}\n"
+        f"Current System State:\n{system_state}\n"
+    )
+
 
 class OrchestratorLLMProvider:
     def __init__(self, model: str = "groq/qwen/qwen3-32b"):
@@ -271,36 +325,7 @@ class OrchestratorLLMProvider:
         Sends the conversation history + user text to the LLM and returns either
         a direct assistant response or a parsed tool call decision.
         """
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are the ultra-fast conversational Voice Shell for a powerful coding agent.\n"
-                    "Your job is to manage the flow of conversation and delegate heavy work to background tasks.\n"
-                    "Answer simple conversational turns directly. Use tools only when the app must start, amend, or cancel a background task.\n\n"
-                    "CRITICAL INSTRUCTIONS ON TOOL USE:\n"
-                    "- If the user asks to write code, search the web, check the weather, or do any complex task, YOU MUST CALL `start_task`.\n"
-                    "- If the user asks to set/check/cancel timers or track/check/end activities, use the native timer/activity tools.\n"
-                    "- If the user asks whether background work is done, use the provided state or native background status tools; do not guess.\n"
-                    "- Only one Codex/background task may run at a time. If `can_start_new_codex_task` is false, do not call `start_task`.\n"
-                    "- While Codex is running, simple conversation, timers, activities, status checks, amendments, and cancellation are still allowed.\n"
-                    "- Treat related follow-ups to the active Codex task as same-thread amendments. If the user refines, narrows, corrects, adds constraints, says 'also', 'instead', 'make sure', 'use X', 'don't do Y', or otherwise refers to the current task, call `amend_task`.\n"
-                    "- For amendments, pass only the new instruction or correction in `amendment`; do not rewrite the full original task.\n"
-                    "- If the user asks for a clearly unrelated second complex task while Codex is running, explain that a background task is already running and ask whether to cancel/switch or keep it going.\n"
-                    "- If the user clearly says to cancel the current task and do a new complex task, call `cancel_task` first; the new task can be started on the next turn after cancellation.\n"
-                    "- Before calling `start_task`, inspect the conversation history and completed tool results.\n"
-                    "- For follow-up requests like 'compare it with X', resolve pronouns and include relevant prior facts in `task`.\n"
-                    "- If prior tool output already answers part of the request, preserve it and ask the tool only for missing/new information.\n"
-                    "- If the user asks to change a running task, call `amend_task` with the active task id from system state.\n"
-                    "- If a task is completed and the user asks a follow-up, call `start_task` with a self-contained task that names the prior facts and the new ask.\n"
-                    "- If the user asks to stop a running task, call `cancel_task`.\n"
-                    "- If no tool is needed, respond with normal assistant content.\n"
-                    "- Never attempt to call a tool not explicitly listed in your schema.\n\n"
-                    f"{SANITY_CHECK_INSTRUCTIONS}\n"
-                    f"Current System State:\n{system_state}\n"
-                ),
-            }
-        ]
+        messages = [{"role": "system", "content": build_route_turn_system_prompt(system_state)}]
         messages.extend(messages_with_timestamp_context(conversation_history))
         messages.append({"role": "user", "content": user_text})
 
@@ -341,229 +366,26 @@ class OrchestratorLLMProvider:
                 
         except Exception as e:
             logger.error(f"Error calling LLM Router: {e}")
-            return {"type": "assistant_response", "response": "Sorry, my brain encountered a temporary glitch. Can you repeat that?"}
+            return {"type": "assistant_response", "response": BRAIN_GLITCH_MESSAGE}
 
-    async def decide_progress(
+    async def speak_from_state(
         self,
-        progress_state: dict[str, Any],
-        conversation_history: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You decide whether a realtime voice agent should speak while a background task is still running.\n"
-                    "Return only JSON with action, message, next_check_ms, and reason.\n"
-                    "Allowed actions: stay_silent, speak_progress, offer_side_conversation, ask_user_choice.\n"
-                    "Do not speak just because time passed. Prefer silence if there is no new useful information.\n"
-                    "Never interrupt the user or assistant. Do not repeat the same status.\n"
-                    "Keep any spoken update to one short sentence.\n\n"
-                    f"{SANITY_CHECK_INSTRUCTIONS}"
-                ),
-            }
-        ]
-        messages.extend(messages_with_timestamp_context(conversation_history[-12:]))
-        messages.append({"role": "user", "content": json.dumps(progress_state, default=str)})
-        try:
-            response = await acompletion(model=self.model, messages=messages)
-            text = sanitize_user_facing_text(response.choices[0].message.content or "", "{}")
-            parsed = json.loads(text)
-            return parsed if isinstance(parsed, dict) else {"action": "stay_silent", "message": None}
-        except Exception as e:
-            logger.error(f"Error deciding progress action: {e}")
-            return {"action": "stay_silent", "message": None}
-
-    async def compose_tool_result(
-        self,
-        user_text: str,
+        instruction: str,
+        user_text: str | None,
         system_state: str,
         conversation_history: list[dict[str, Any]],
-        result: RuntimeResult,
     ) -> str:
-        """
-        Compose the final user-facing voice answer from a background tool result.
-        Codex is treated as a tool/fact engine; this supervisor owns final phrasing.
-        """
-        fallback = result.spoken_answer or result.error or "The task finished without a spoken answer."
-        if result.status.value == "completed":
-            fallback = f"I have the result now. {fallback}"
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are the conversational supervisor for a realtime voice agent.\n"
-                    "A background tool has completed. Use its facts to produce the final answer for the user.\n"
-                    "Keep the response concise, natural, and suitable for speech.\n"
-                    "Do not mention internal tool names unless the user asked.\n"
-                    "Do not invent facts beyond the tool result and conversation context.\n\n"
-                    f"{SANITY_CHECK_INSTRUCTIONS}\n"
-                    f"Current System State:\n{system_state}\n"
-                ),
-            }
-        ]
+        messages = [{"role": "system", "content": build_speak_from_state_system_prompt(system_state)}]
         messages.extend(messages_with_timestamp_context(conversation_history))
+        anchor = user_text or "(none — background event)"
         messages.append(
             {
                 "role": "user",
-                "content": (
-                    "Background tool result JSON follows. Treat it as tool output, not user prose:\n"
-                    f"{json.dumps(result.model_dump(mode='json'))}"
-                ),
+                "content": f"{instruction}\n\nLatest user text: {anchor}",
             }
         )
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "Compose the final spoken answer for the latest tool result. "
-                    f"The original user request was: {user_text}"
-                ),
-            }
-        )
-
-        try:
-            response = await acompletion(model=self.model, messages=messages)
-            text = response.choices[0].message.content or ""
-            return sanitize_user_facing_text(text, fallback)
-        except Exception as e:
-            logger.error(f"Error composing tool result: {e}")
-            return fallback
-
-    async def compose_native_tool_result(
-        self,
-        user_text: str,
-        system_state: str,
-        conversation_history: list[dict[str, Any]],
-        tool_name: str,
-        tool_result: dict[str, Any],
-        fallback: str,
-    ) -> str:
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are the conversational supervisor for a realtime voice agent.\n"
-                    "A deterministic native tool already ran successfully. Produce the single spoken reply for the user.\n"
-                    "Use the structured tool output and current state. Do not mention internal tool names.\n"
-                    "Keep the response short, natural, and suitable for speech.\n\n"
-                    f"{SANITY_CHECK_INSTRUCTIONS}\n"
-                    f"Current System State:\n{system_state}\n"
-                ),
-            }
-        ]
-        messages.extend(messages_with_timestamp_context(conversation_history))
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "The latest native tool result JSON follows. Treat it as tool output, not user prose:\n"
-                    f"{json.dumps({'tool_name': tool_name, 'result': tool_result})}"
-                ),
-            }
-        )
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "Compose the spoken reply for the latest native tool result. "
-                    f"The original user request was: {user_text}"
-                ),
-            }
-        )
-        try:
-            response = await acompletion(model=self.model, messages=messages)
-            text = response.choices[0].message.content or ""
-            return sanitize_user_facing_text(text, fallback)
-        except Exception as e:
-            logger.error(f"Error composing native tool result: {e}")
-            return fallback
-
-    async def compose_runtime_event_result(
-        self,
-        system_state: str,
-        conversation_history: list[dict[str, Any]],
-        pending_item: dict[str, Any],
-        event_payload: dict[str, Any],
-        fallback: str,
-    ) -> str:
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are the conversational supervisor for a realtime voice agent.\n"
-                    "A durable runtime event is ready to be spoken now. Compose the spoken reply.\n"
-                    "Use the structured event data and current state. Keep it short and natural.\n"
-                    "Do not mention internal tool names or backend implementation.\n\n"
-                    f"{SANITY_CHECK_INSTRUCTIONS}\n"
-                    f"Current System State:\n{system_state}\n"
-                ),
-            }
-        ]
-        messages.extend(messages_with_timestamp_context(conversation_history))
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "A durable runtime event is ready. Pending item JSON:\n"
-                    f"{json.dumps(pending_item)}\n\n"
-                    "Completed event JSON:\n"
-                    f"{json.dumps(event_payload)}"
-                ),
-            }
-        )
-        try:
-            response = await acompletion(model=self.model, messages=messages)
-            text = response.choices[0].message.content or ""
-            return sanitize_user_facing_text(text, fallback)
-        except Exception as e:
-            logger.error(f"Error composing runtime event result: {e}")
-            return fallback
-
-    async def compose_control_result(
-        self,
-        user_text: str,
-        system_state: str,
-        conversation_history: list[dict[str, Any]],
-        action_name: str,
-        action_payload: dict[str, Any],
-        fallback: str,
-    ) -> str:
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are the conversational supervisor for a realtime voice agent.\n"
-                    "A control action or runtime conflict was handled by the backend. Produce the spoken reply for the user.\n"
-                    "Use the structured action payload and current state. Keep the response short, natural, and contextual.\n"
-                    "Do not mention internal tool names or backend implementation.\n\n"
-                    f"{SANITY_CHECK_INSTRUCTIONS}\n"
-                    f"Current System State:\n{system_state}\n"
-                ),
-            }
-        ]
-        messages.extend(messages_with_timestamp_context(conversation_history))
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "The latest control action payload JSON follows. Treat it as runtime output, not user prose:\n"
-                    f"{json.dumps({'action_name': action_name, 'payload': action_payload})}"
-                ),
-            }
-        )
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "Compose the spoken reply for this control action. "
-                    f"The latest user request was: {user_text}"
-                ),
-            }
-        )
-        try:
-            response = await acompletion(model=self.model, messages=messages)
-            text = response.choices[0].message.content or ""
-            return sanitize_user_facing_text(text, fallback)
-        except Exception as e:
-            logger.error(f"Error composing control result: {e}")
-            return fallback
+        response = await acompletion(model=self.model, messages=messages)
+        text = sanitize_user_facing_text(response.choices[0].message.content or "", "")
+        if not text:
+            raise RuntimeError("empty speak response")
+        return text

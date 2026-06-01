@@ -184,6 +184,12 @@ async def test_partial_cancellation_stops_active_task_before_final() -> None:
         controller=controller,
         stt_provider=FakeSttProvider("stop that"),
         requested_asr_mode=AsrMode.SPEECH_GATED_STREAMING,
+        timing=VoiceTimingConfig(
+            control_loop_ms=10,
+            turn_commit_default_wait_ms=0,
+            turn_commit_active_task_wait_ms=0,
+            turn_commit_hard_command_wait_ms=0,
+        ),
     )
     session_id = "browser-session"
     segment_id = "segment-1"
@@ -212,7 +218,65 @@ async def test_partial_cancellation_stops_active_task_before_final() -> None:
     events = await orchestrator.drain_events(session_id)
 
     assert any(event.event == VoiceEventType.TRANSCRIPT_PARTIAL for event in events)
+    assert controller.get_status(start.task.task_id).task.status == TaskStatus.RUNNING
+
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(
+            event=VoiceEventType.SPEECH_ENDED,
+            transport=VoiceTransportKind.BROWSER,
+            session_id=session_id,
+            metadata={"speech_segment_id": segment_id},
+        ),
+    )
+    import asyncio
+    for _ in range(100):
+        if controller.get_status(start.task.task_id).task.status == TaskStatus.CANCELLED:
+            break
+        await asyncio.sleep(0.01)
+
     assert controller.get_status(start.task.task_id).task.status == TaskStatus.CANCELLED
+    await orchestrator.stop_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_partial_pause_does_not_cancel_active_task() -> None:
+    controller = AgentController(runtime=FakeRuntime(delay_seconds=1.0))
+    start = await controller.start_task(StartTaskRequest(task="Long task."))
+    orchestrator = VoiceSessionOrchestrator(
+        controller=controller,
+        stt_provider=FakeSttProvider("pause"),
+        requested_asr_mode=AsrMode.SPEECH_GATED_STREAMING,
+    )
+    session_id = "browser-session"
+    segment_id = "segment-1"
+    state = await orchestrator.start_session(session_id, VoiceTransportKind.BROWSER)
+    state.active_task_id = start.task.task_id
+
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(
+            event=VoiceEventType.SPEECH_STARTED,
+            transport=VoiceTransportKind.BROWSER,
+            session_id=session_id,
+            metadata={"speech_segment_id": segment_id},
+        ),
+    )
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(
+            event=VoiceEventType.USER_TURN_AUDIO,
+            transport=VoiceTransportKind.BROWSER,
+            session_id=session_id,
+            audio_ref=pcm_ref(),
+            metadata={"speech_segment_id": segment_id, "sequence": 1},
+        ),
+    )
+    events = await orchestrator.drain_events(session_id)
+
+    assert any(event.event == VoiceEventType.TRANSCRIPT_PARTIAL for event in events)
+    assert controller.get_status(start.task.task_id).task.status == TaskStatus.RUNNING
+    assert state.active_task_id == start.task.task_id
     await orchestrator.stop_session(session_id)
 
 

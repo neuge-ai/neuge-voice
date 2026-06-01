@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock
 
 import pytest
 
-from nextgen_voice_agent.models.runtime import RuntimeResult, RuntimeResultStatus
 from nextgen_voice_agent.voice.llm_router import OrchestratorLLMProvider, ROUTER_TOOLS, sanitize_user_facing_text
 
 
@@ -138,23 +138,34 @@ async def test_router_rejects_unknown_tool_call(mock_litellm_acompletion) -> Non
 
 
 @pytest.mark.asyncio
-async def test_router_composes_tool_result_for_final_voice_answer(mock_litellm_acompletion) -> None:
+async def test_speak_from_state_uses_history_without_tools(mock_litellm_acompletion) -> None:
     mock_litellm_acompletion.side_effect = None
     mock_litellm_acompletion.return_value = _completion_message(
         content="<think>Need to summarize the facts.</think> Delhi is very hot today."
     )
     provider = OrchestratorLLMProvider(model="test-model")
-    result = RuntimeResult(
-        task_id="task_1",
-        generation=1,
-        status=RuntimeResultStatus.COMPLETED,
-        spoken_answer="raw facts: Delhi 43 C",
-        technical_summary="weather lookup",
+    history = [
+        {"role": "user", "content": "Check Delhi weather."},
+        {
+            "role": "tool",
+            "content": json.dumps(
+                {
+                    "task_id": "task_1",
+                    "status": "completed",
+                    "spoken_answer": "raw facts: Delhi 43 C",
+                }
+            ),
+        },
+    ]
+
+    answer = await provider.speak_from_state(
+        "User just spoke. Latest tool result is in history. Say the reply.",
+        "Check Delhi weather.",
+        "Active Task ID: None",
+        history,
     )
 
-    answer = await provider.compose_tool_result("Check Delhi weather.", "Completed Task ID: task_1", [], result)
-
     assert answer == "Delhi is very hot today."
-    compose_messages = mock_litellm_acompletion.call_args.kwargs["messages"]
-    assert all(message["role"] != "tool" for message in compose_messages)
-    assert any("Background tool result JSON" in message["content"] for message in compose_messages if message["role"] == "user")
+    assert mock_litellm_acompletion.call_args.kwargs.get("tools") is None
+    speak_messages = mock_litellm_acompletion.call_args.kwargs["messages"]
+    assert any("User just spoke" in message["content"] for message in speak_messages if message["role"] == "user")
