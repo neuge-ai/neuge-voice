@@ -1,6 +1,5 @@
 import pytest
 from unittest.mock import MagicMock, patch
-from pydantic import SecretStr
 
 from nextgen_voice_agent.config import Settings
 from nextgen_voice_agent.voice.tts import ElevenLabsTtsProvider, TtsRequest, TtsProviderError
@@ -8,12 +7,8 @@ from nextgen_voice_agent.voice.tts import ElevenLabsTtsProvider, TtsRequest, Tts
 
 @pytest.mark.asyncio
 async def test_elevenlabs_tts_missing_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    settings = Settings(
-        tts_provider="elevenlabs",
-    )
-    # Explicitly bypass Pydantic loader to ensure key is missing for the test
-    object.__setattr__(settings, "elevenlabs_api_key", None)
-    provider = ElevenLabsTtsProvider(settings)
+    monkeypatch.setattr("nextgen_voice_agent.voice.tts.get_secret", lambda _key: None)
+    provider = ElevenLabsTtsProvider(Settings(tts_provider="elevenlabs"))
 
     with pytest.raises(TtsProviderError) as exc_info:
         await provider.synthesize(TtsRequest(text="Hello"))
@@ -24,11 +19,8 @@ async def test_elevenlabs_tts_missing_api_key(monkeypatch: pytest.MonkeyPatch) -
 
 @pytest.mark.asyncio
 async def test_elevenlabs_tts_empty_text(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("NVA_ELEVENLABS_API_KEY", "mock_key")
-    settings = Settings(
-        tts_provider="elevenlabs",
-    )
-    provider = ElevenLabsTtsProvider(settings)
+    monkeypatch.setattr("nextgen_voice_agent.voice.tts.get_secret", lambda key: "mock_key" if key == "elevenlabs_api_key" else None)
+    provider = ElevenLabsTtsProvider(Settings(tts_provider="elevenlabs"))
 
     with pytest.raises(TtsProviderError) as exc_info:
         await provider.synthesize(TtsRequest(text="  "))
@@ -40,14 +32,14 @@ async def test_elevenlabs_tts_empty_text(monkeypatch: pytest.MonkeyPatch) -> Non
 @pytest.mark.asyncio
 @patch("elevenlabs.client.ElevenLabs")
 async def test_elevenlabs_tts_success(mock_client_class: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("NVA_ELEVENLABS_API_KEY", "mock_key")
+    monkeypatch.setattr("nextgen_voice_agent.voice.tts.get_secret", lambda key: "mock_key" if key == "elevenlabs_api_key" else None)
     settings = Settings(
         tts_provider="elevenlabs",
         elevenlabs_voice_id="aria",
         elevenlabs_model_id="multilingual",
         elevenlabs_output_format="mp3_44100_128",
     )
-    
+
     mock_client = MagicMock()
     mock_client_class.return_value = mock_client
     mock_client.text_to_speech.convert.return_value = [b"chunk1", b"chunk2"]

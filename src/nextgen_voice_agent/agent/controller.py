@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator
+from datetime import timedelta
 
 from nextgen_voice_agent.agent.prompts import build_codex_task_prompt
+from nextgen_voice_agent.config import Settings, get_settings
 from nextgen_voice_agent.models.events import (
     AgentEvent,
     ApprovalRequestedEvent,
@@ -47,12 +49,15 @@ class TaskConflictError(ValueError):
 
 
 class EventHub:
-    def __init__(self) -> None:
+    def __init__(self, history_limit: int = 200) -> None:
         self._subscribers: set[asyncio.Queue[AgentEvent]] = set()
         self.history: list[AgentEvent] = []
+        self._history_limit = history_limit
 
     async def publish(self, event: AgentEvent) -> None:
         self.history.append(event)
+        if len(self.history) > self._history_limit:
+            self.history = self.history[-self._history_limit :]
         for subscriber in list(self._subscribers):
             await subscriber.put(event)
 
@@ -69,9 +74,15 @@ class EventHub:
 
 
 class AgentController:
-    def __init__(self, runtime: TaskRuntime, event_hub: EventHub | None = None) -> None:
+    def __init__(
+        self,
+        runtime: TaskRuntime,
+        event_hub: EventHub | None = None,
+        settings: Settings | None = None,
+    ) -> None:
+        self._settings = settings or get_settings()
         self.runtime = runtime
-        self.event_hub = event_hub or EventHub()
+        self.event_hub = event_hub or EventHub(history_limit=self._settings.event_history_limit)
         self.tasks: dict[str, Task] = {}
         self.results: dict[str, RuntimeResult] = {}
         self.active_task_id: str | None = None
@@ -200,6 +211,7 @@ class AgentController:
                 status=task.status,
             )
         )
+        self._prune_completed_tasks()
         return CancelTaskResponse(task_id=task_id, status=task.status, message="Task cancelled.")
 
     def get_status(self, task_id: str) -> TaskStatusResponse:
@@ -318,6 +330,7 @@ class AgentController:
                     error=task.user_visible_status,
                 )
             )
+            self._prune_completed_tasks()
             return
 
         if result.status == RuntimeResultStatus.CANCELLED:
@@ -338,6 +351,32 @@ class AgentController:
                 result=result,
             )
         )
+        self._prune_completed_tasks()
+
+    def _prune_completed_tasks(self) -> None:
+        terminal = {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+            TaskStatus.SUPERSEDED,
+            TaskStatus.IGNORED_STALE_RESULT,
+        }
+        completed = [task for task in self.tasks.values() if task.status in terminal]
+        if not completed:
+            return
+        ttl = timedelta(minutes=self._settings.completed_task_ttl_minutes)
+        cutoff = utc_now() - ttl
+        completed.sort(key=lambda task: task.last_update_at, reverse=True)
+        keep_ids: set[str] = set()
+        for task in completed[: self._settings.max_completed_tasks]:
+            if task.last_update_at >= cutoff:
+                keep_ids.add(task.task_id)
+        if self.active_task_id:
+            keep_ids.add(self.active_task_id)
+        for task_id in list(self.tasks):
+            if task_id not in keep_ids:
+                self.tasks.pop(task_id, None)
+                self.results.pop(task_id, None)
 
     async def _publish_stale(self, task_id: str, result_generation: int, current_generation: int) -> None:
         task = self.tasks.get(task_id)

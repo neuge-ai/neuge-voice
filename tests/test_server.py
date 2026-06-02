@@ -2,6 +2,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from nextgen_voice_agent.config import Settings
+from nextgen_voice_agent.voice.tool_catalog import REALTIME_CODEX_TOOL_NAMES, realtime_native_tool_names
 from nextgen_voice_agent.server.app import create_app
 from nextgen_voice_agent.voice.tts import (
     BrowserDevTtsProvider,
@@ -110,17 +111,9 @@ async def test_realtime_session_config_exposes_task_tools() -> None:
     payload = response.json()
     assert payload["model"] == "gpt-realtime-mini"
     assert "audio" in payload["modalities"]
-    assert {tool["name"] for tool in payload["tools"]} >= {
-        "start_codex_task",
-        "amend_codex_task",
-        "cancel_codex_task",
-        "get_codex_task_status",
-        "read_codex_result",
-        "approve_codex_action",
-        "start_timer",
-        "start_activity",
-        "get_background_task_status",
-    }
+    tool_names = {tool["name"] for tool in payload["tools"]}
+    assert REALTIME_CODEX_TOOL_NAMES <= tool_names
+    assert realtime_native_tool_names() <= tool_names
     assert "STATE AND PLAUSIBILITY CHECKS" in payload["instructions"]
     assert "Only one Codex task may run at a time" in payload["instructions"]
     assert "related follow-ups to the active task" in payload["instructions"]
@@ -315,8 +308,7 @@ async def test_config_open_returns_graceful_failure_when_launch_raises(monkeypat
 
 @pytest.mark.asyncio
 async def test_tts_endpoint_returns_browser_dev_text(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("NVA_TTS_PROVIDER", "browser_dev")
-    app = create_app()
+    app = create_app(Settings(tts_provider="browser_dev"))
     transport = ASGITransport(app=app)
 
     async with AsyncClient(transport=transport, base_url="http://test") as client:

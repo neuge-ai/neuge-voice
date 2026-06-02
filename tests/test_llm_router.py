@@ -5,7 +5,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from nextgen_voice_agent.voice.llm_router import OrchestratorLLMProvider, ROUTER_TOOLS, sanitize_user_facing_text
+from nextgen_voice_agent.voice.llm_router import OrchestratorLLMProvider, ROUTER_TOOLS, TOOL_ACTIONS, sanitize_user_facing_text
+from nextgen_voice_agent.voice.tool_catalog import ROUTER_TOOL_NAMES
 
 
 def _completion_message(content: str | None = None, tool_name: str | None = None, arguments: str = "{}") -> MagicMock:
@@ -22,6 +23,11 @@ def _completion_message(content: str | None = None, tool_name: str | None = None
     response = MagicMock()
     response.choices = [choice]
     return response
+
+
+def test_router_tool_names_match_catalog() -> None:
+    assert TOOL_ACTIONS == ROUTER_TOOL_NAMES
+    assert {tool["function"]["name"] for tool in ROUTER_TOOLS} == set(ROUTER_TOOL_NAMES)
 
 
 def test_router_tools_include_codex_and_native_tools_but_exclude_answer_directly() -> None:
@@ -73,6 +79,7 @@ async def test_router_returns_assistant_content_without_tool(mock_litellm_acompl
     decision = await provider.route_turn("hello", "Active Task ID: None", [])
 
     assert decision == {"type": "assistant_response", "response": "Hello."}
+    assert mock_litellm_acompletion.call_args.kwargs["tools"] == ROUTER_TOOLS
     assert mock_litellm_acompletion.call_args.kwargs["tool_choice"] == "auto"
     system_prompt = mock_litellm_acompletion.call_args.kwargs["messages"][0]["content"]
     assert "inspect the conversation history" in system_prompt

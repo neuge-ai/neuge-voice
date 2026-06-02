@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import logging
 from typing import Any
@@ -5,52 +7,6 @@ from typing import Any
 from nextgen_voice_agent.runtimes.codex_runtime import CodexAppServerClient
 
 logger = logging.getLogger(__name__)
-
-_app_server_client: CodexAppServerClient | None = None
-
-
-def _get_app_server_client() -> CodexAppServerClient:
-    global _app_server_client
-    if _app_server_client is None:
-        _app_server_client = CodexAppServerClient()
-    return _app_server_client
-
-
-async def _run_async_command(*args: str) -> str:
-    """Helper to run a command asynchronously and return stdout."""
-    process = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await process.communicate()
-    
-    if process.returncode != 0:
-        error_msg = stderr.decode().strip()
-        logger.error(f"Command failed: {' '.join(args)} - {error_msg}")
-        raise RuntimeError(f"CLI Error: {error_msg}")
-        
-    return stdout.decode().strip()
-
-async def get_mcp_tools() -> list:
-    """List MCP servers/tools via the persistent Codex app-server."""
-    response = await _get_app_server_client().request(
-        "mcpServerStatus/list",
-        {"detail": "toolsAndAuthOnly"},
-    )
-    return _normalize_mcp_status_response(response)
-
-
-async def add_mcp_tool(name: str, command: str, args: list[str]) -> bool:
-    """Executes `codex mcp add {name} {command} {args}`."""
-    cli_args = ["codex", "mcp", "add", name, command] + args
-    await _run_async_command(*cli_args)
-    return True
-
-async def remove_mcp_tool(name: str) -> bool:
-    """Executes `codex mcp remove {name}`."""
-    await _run_async_command("codex", "mcp", "remove", name)
-    return True
 
 
 def _normalize_mcp_status_response(response: Any) -> list[dict[str, Any]]:
@@ -73,3 +29,55 @@ def _normalize_mcp_status_response(response: Any) -> list[dict[str, Any]]:
             entry["status"] = server.get("startupStatus") or server.get("state") or "unknown"
         normalized.append(entry)
     return normalized
+
+
+class CodexAppServerService:
+    """App-owned Codex app-server and MCP CLI operations."""
+
+    def __init__(self, client: CodexAppServerClient | None = None) -> None:
+        self._client = client
+        self._owns_client = client is None
+
+    async def _get_client(self) -> CodexAppServerClient:
+        if self._client is None:
+            self._client = CodexAppServerClient()
+        return self._client
+
+    async def _run_async_command(self, *args: str) -> str:
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+
+        if process.returncode != 0:
+            error_msg = stderr.decode().strip()
+            logger.error("Command failed: %s - %s", " ".join(args), error_msg)
+            raise RuntimeError(f"CLI Error: {error_msg}")
+
+        return stdout.decode().strip()
+
+    async def get_mcp_tools(self) -> list[dict[str, Any]]:
+        client = await self._get_client()
+        response = await client.request(
+            "mcpServerStatus/list",
+            {"detail": "toolsAndAuthOnly"},
+        )
+        return _normalize_mcp_status_response(response)
+
+    async def add_mcp_tool(self, name: str, command: str, args: list[str]) -> bool:
+        cli_args = ["codex", "mcp", "add", name, command] + args
+        await self._run_async_command(*cli_args)
+        return True
+
+    async def remove_mcp_tool(self, name: str) -> bool:
+        await self._run_async_command("codex", "mcp", "remove", name)
+        return True
+
+    async def shutdown(self) -> None:
+        if self._client is None:
+            return
+        await self._client.stop()
+        if self._owns_client:
+            self._client = None

@@ -8,6 +8,7 @@
   "main": "main.cjs",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
+    "typecheck": "tsc -b --noEmit",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 127.0.0.1",
     "electron:dev": "concurrently -k \"cross-env BROWSER=none npm run dev\" \"wait-on http://localhost:5173 && cross-env NODE_ENV=development electron . --no-sandbox\"",

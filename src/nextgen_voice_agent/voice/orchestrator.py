@@ -7,7 +7,6 @@ import random
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from difflib import SequenceMatcher
 from enum import StrEnum
 from typing import Any, Callable
 
@@ -16,9 +15,17 @@ from nextgen_voice_agent.config import get_settings
 from nextgen_voice_agent.models.runtime import RuntimeResult, RuntimeResultStatus
 from nextgen_voice_agent.models.task import AmendTaskRequest, CancelTaskRequest, StartTaskRequest, TaskStatus
 from nextgen_voice_agent.models.voice import VoiceEvent, VoiceEventType, VoiceTransportKind
+from nextgen_voice_agent.models.voice_metadata import (
+    AssistantSpeechEndedMetadata,
+    AssistantSpeechStartedMetadata,
+    DurableDeliveryMetadata,
+    parse_metadata,
+)
 from nextgen_voice_agent.voice.llm_router import BRAIN_GLITCH_MESSAGE
+from nextgen_voice_agent.voice.session_context import VoiceSessionContext
 from nextgen_voice_agent.voice.stt import (
     AsrMode,
+    AudioFrame,
     SttProvider,
     SttStream,
     SttTranscriptEvent,
@@ -26,24 +33,24 @@ from nextgen_voice_agent.voice.stt import (
     UtteranceBuffer,
     parse_audio_frame,
 )
+from nextgen_voice_agent.voice.voice_logging import log_voice_event
+from nextgen_voice_agent.voice.conversation_history import ConversationHistoryManager
+from nextgen_voice_agent.voice.delivery_manager import DeliveryManager, DeliveryManagerCallbacks
+from nextgen_voice_agent.voice.interrupt_manager import InterruptManager, InterruptManagerCallbacks
+from nextgen_voice_agent.voice.interrupt_types import ActiveVadClassification, InterruptCandidate, PostVadClassification
+from nextgen_voice_agent.voice.turn_commit import TurnCommitter
+from nextgen_voice_agent.voice.turn_text import (
+    HARD_INTERRUPT_COMMANDS,
+    SOFT_AMENDMENT_MARKERS,
+    is_hard_interrupt_command,
+    is_soft_amendment_marker_only,
+    normalize_turn_text,
+)
+from nextgen_voice_agent.voice.native_tool_executor import NativeToolExecutor
+from nextgen_voice_agent.voice.session_entities import DeliveryRecord, SessionActivity, SessionTimer, format_ms_to_human
+from nextgen_voice_agent.voice.tool_catalog import NATIVE_TOOL_NAMES
 
-HARD_INTERRUPT_COMMANDS = {"stop", "cancel"}
-SOFT_AMENDMENT_MARKERS = {"actually", "no", "wrong", "also", "instead", "but"}
 RECENT_ASSISTANT_UTTERANCE_LIMIT = 6
-NATIVE_TOOL_NAMES = {
-    "start_timer",
-    "get_timer_status",
-    "list_active_timers",
-    "cancel_timer",
-    "start_activity",
-    "get_activity_status",
-    "list_active_activities",
-    "end_activity",
-    "cancel_activity",
-    "list_active_background_tasks",
-    "get_background_task_status",
-    "cancel_background_task",
-}
 
 USER_TURN_FOLLOWUP_INSTRUCTION = "User just spoke. Latest tool result is in history. Say the reply."
 BACKGROUND_RESEARCH_INSTRUCTION = "Background research finished; result is in history. Say the reply."
@@ -56,27 +63,6 @@ class VoiceTurnState(StrEnum):
     ASSISTANT_SPEAKING = "assistant_speaking"
     BARGE_IN_CANDIDATE = "barge_in_candidate"
     POST_TTS_COOLDOWN = "post_tts_cooldown"
-
-
-class ActiveVadClassification(StrEnum):
-    NO_TRANSCRIPT = "no_transcript"
-    ECHO_LIKE = "echo_like"
-    DIVERGENT_TEXT = "divergent_text"
-
-
-class PostVadClassification(StrEnum):
-    NO_TRANSCRIPT = "no_transcript"
-    ECHO = "echo"
-    WEAK = "weak"
-    GENUINE = "genuine"
-
-
-@dataclass
-class InterruptCandidate:
-    text: str = ""
-    source: str = "none"
-    last_active_vad_classification: ActiveVadClassification = ActiveVadClassification.NO_TRANSCRIPT
-    last_stt_confidence: float | None = None
 
 
 @dataclass(frozen=True)
@@ -111,47 +97,6 @@ class VoiceTimingConfig:
 
 
 @dataclass
-class SessionTimer:
-    timer_id: str
-    label: str
-    started_at: datetime
-    duration_ms: int
-    reason: str | None = None
-    status: str = "running"
-    ui_title: str | None = None
-
-    @property
-    def ends_at(self) -> datetime:
-        return self.started_at + timedelta(milliseconds=self.duration_ms)
-
-
-@dataclass
-class SessionActivity:
-    activity_id: str
-    activity_type: str
-    label: str
-    started_at: datetime
-    target_duration_ms: int | None = None
-    target_distance_meters: int | None = None
-    status: str = "active"
-    ui_title: str | None = None
-
-
-@dataclass
-class DeliveryRecord:
-    delivery_id: str
-    kind: str
-    task_id: str
-    generation: int
-    text: str
-    original_request: str
-    emitted_at: datetime
-    status: str = "emitted"
-    reason: str | None = None
-    spoken_at: datetime | None = None
-
-
-@dataclass(frozen=True)
 class AsrTurnCandidate:
     text: str
     segment_id: str
@@ -161,16 +106,6 @@ class AsrTurnCandidate:
     during_cooldown: bool
     status: str = "rejected"
     reason: str = "unknown"
-
-
-def format_ms_to_human(ms: int | None) -> str | None:
-    if ms is None:
-        return None
-    total_seconds = max(0, ms) // 1000
-    minutes, seconds = divmod(total_seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    days, hours = divmod(hours, 24)
-    return f"{days} Days {hours} hours {minutes} minutes and {seconds} seconds"
 
 
 @dataclass
@@ -232,6 +167,7 @@ class VoiceSessionState:
     post_vad_commit_pending: bool = False
     post_vad_commit_text: str = ""
     interrupt_candidate: InterruptCandidate = field(default_factory=InterruptCandidate)
+    last_activity_at: datetime | None = None
 
 
 class VoiceSessionOrchestrator:
@@ -245,6 +181,7 @@ class VoiceSessionOrchestrator:
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.controller = controller
+        self._settings = get_settings()
         self.stt_provider = stt_provider
         
         if llm_provider is None:
@@ -258,6 +195,50 @@ class VoiceSessionOrchestrator:
         self.clock = clock or datetime.now
         self.sessions: dict[str, VoiceSessionState] = {}
         self.event_listeners: set[Callable[[str, VoiceEvent], None]] = set()
+        self._native_tool_executor = NativeToolExecutor(controller=self.controller, clock=self.clock)
+        self._conversation_history = ConversationHistoryManager(
+            controller=self.controller,
+            clock=self.clock,
+            session_state_payload=self._session_state_payload,
+        )
+        self._delivery_manager = DeliveryManager(
+            controller=self.controller,
+            clock=self.clock,
+            timing=self.timing,
+            callbacks=DeliveryManagerCallbacks(
+                speak_background_event=self._speak_background_event,
+                append_history=self._append_history,
+                emit=self._emit,
+                iso_now=self._iso_now,
+                elapsed_ms=self._elapsed_ms,
+            ),
+        )
+        self._interrupt_manager = InterruptManager(
+            timing=self.timing,
+            clock=self.clock,
+            callbacks=InterruptManagerCallbacks(
+                emit=self._emit,
+                stop_assistant_audio=self._stop_assistant_audio,
+                apply_authoritative_user_transcript=self._apply_authoritative_user_transcript,
+            ),
+            assistant_echo_reason=self._assistant_echo_reason,
+        )
+        self._turn_committer = TurnCommitter(
+            timing=self.timing,
+            clock=self.clock,
+            elapsed_ms=self._elapsed_ms,
+            handle_user_turn=self._handle_user_turn,
+        )
+
+    async def execute_native_tool(
+        self,
+        session_id: str,
+        transport: VoiceTransportKind,
+        tool_name: str,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        state = await self.start_session(session_id, transport)
+        return await self._native_tool_executor.execute(state, tool_name, args)
 
     async def start_session(self, session_id: str, transport_kind: VoiceTransportKind) -> VoiceSessionState:
         existing = self.sessions.get(session_id)
@@ -265,9 +246,15 @@ class VoiceSessionOrchestrator:
             return existing
 
         state = VoiceSessionState(session_id=session_id, transport=transport_kind)
+        state.last_activity_at = self.clock()
         self.sessions[session_id] = state
         state.loop_task = asyncio.create_task(self._control_loop(state))
         await self._emit(state, VoiceEventType.SESSION_STARTED, "Voice session started.")
+        log_voice_event(
+            "session_started",
+            session_id=session_id,
+            transport=transport_kind.value,
+        )
         return state
 
     async def stop_session(self, session_id: str) -> None:
@@ -282,9 +269,80 @@ class VoiceSessionOrchestrator:
             except asyncio.CancelledError:
                 pass
         await self._emit(state, VoiceEventType.SESSION_STOPPED, "Voice session stopped.")
+        self.sessions.pop(session_id, None)
+        log_voice_event("session_stopped", session_id=session_id, transport=state.transport.value)
+
+    async def ensure_session(self, context: VoiceSessionContext) -> str:
+        await self.start_session(context.session_id, context.transport)
+        state = self.sessions[context.session_id]
+        state.last_activity_at = self.clock()
+        log_voice_event(
+            "session_ensured",
+            session_id=context.session_id,
+            transport=context.transport.value,
+        )
+        return context.session_id
+
+    async def ingest_audio_frame(self, session_id: str, frame: AudioFrame) -> None:
+        import base64
+
+        state = self.sessions.get(session_id)
+        if state is None:
+            raise KeyError(f"Unknown voice session: {session_id}")
+        event = VoiceEvent(
+            event=VoiceEventType.USER_TURN_AUDIO,
+            transport=state.transport,
+            session_id=session_id,
+            audio_ref=base64.b64encode(frame.payload).decode("ascii"),
+            metadata={
+                "sample_rate": frame.sample_rate,
+                "channels": frame.channels,
+                "encoding": frame.encoding,
+                "sequence": frame.sequence,
+                "speech_segment_id": frame.speech_segment_id,
+                **frame.metadata,
+            },
+        )
+        await self.handle_voice_event(session_id, event)
+
+    async def end_session(self, session_id: str, reason: str) -> None:
+        log_voice_event("session_ending", session_id=session_id, extra={"reason": reason})
+        await self.stop_session(session_id)
+
+    def has_session(self, session_id: str) -> bool:
+        state = self.sessions.get(session_id)
+        return state is not None and not state.stopped
+
+    def get_active_speech_segment_id(self, session_id: str) -> str:
+        state = self.sessions.get(session_id)
+        if state and state.active_utterance:
+            return state.active_utterance.speech_segment_id
+        return "default"
+
+    def list_active_native_tools(self) -> list[dict[str, str]]:
+        tools: list[dict[str, str]] = []
+        for session in self.sessions.values():
+            for timer in session.active_timers.values():
+                if timer.status == "running":
+                    tools.append({
+                        "id": timer.timer_id,
+                        "type": "timer",
+                        "title": getattr(timer, "ui_title", None) or "Timer",
+                        "started_at": timer.started_at.astimezone().isoformat(),
+                    })
+            for activity in session.active_activities.values():
+                if activity.status == "active":
+                    tools.append({
+                        "id": activity.activity_id,
+                        "type": "activity",
+                        "title": getattr(activity, "ui_title", None) or "Activity",
+                        "started_at": activity.started_at.astimezone().isoformat(),
+                    })
+        return tools
 
     async def handle_voice_event(self, session_id: str, event: VoiceEvent) -> None:
         state = await self.start_session(session_id, event.transport)
+        state.last_activity_at = self.clock()
 
         if event.event == VoiceEventType.SPEECH_STARTED:
             now = self.clock()
@@ -329,7 +387,11 @@ class VoiceSessionOrchestrator:
             state.voice_state = VoiceTurnState.ASSISTANT_SPEAKING
             state.last_assistant_speech_at = now
             state.assistant_speech_started_at = now
-            self._mark_delivery_speaking(state, event.metadata)
+            parsed = parse_metadata(event.event, event.metadata)
+            if isinstance(parsed, AssistantSpeechStartedMetadata):
+                self._mark_delivery_speaking(state, parsed)
+            else:
+                self._mark_delivery_speaking(state, event.metadata)
             state.post_tts_cooldown_expires_at = None
             return
 
@@ -340,7 +402,11 @@ class VoiceSessionOrchestrator:
             state.pause_resume_timer_expires_at = None
             state.last_assistant_speech_at = now
             state.assistant_speech_ended_at = now
-            self._mark_delivery_speech_ended(state, event.metadata)
+            parsed = parse_metadata(event.event, event.metadata)
+            if isinstance(parsed, AssistantSpeechEndedMetadata):
+                self._mark_delivery_speech_ended(state, parsed)
+            else:
+                self._mark_delivery_speech_ended(state, event.metadata)
             state.post_tts_cooldown_expires_at = now + timedelta(milliseconds=self.timing.post_tts_cooldown_ms)
             state.voice_state = VoiceTurnState.POST_TTS_COOLDOWN
             return
@@ -386,33 +452,10 @@ class VoiceSessionOrchestrator:
         return events
 
     async def _maybe_commit_turn(self, state: VoiceSessionState) -> None:
-        if not state.pending_transcript or state.pending_transcript_since is None:
-            return
-
-        elapsed_ms = self._elapsed_ms(state.pending_transcript_since)
-        if state.user_speaking:
-            return
-
-        delay = self._classify_commit_delay(state)
-        if elapsed_ms >= delay:
-            text = state.pending_transcript.strip()
-            state.pending_transcript = ""
-            state.pending_transcript_since = None
-            if text:
-                await self._handle_user_turn(state, text)
+        await self._turn_committer.maybe_commit_turn(state)
 
     def _classify_commit_delay(self, state: VoiceSessionState) -> int:
-        normalized = _normalize_turn_text(state.pending_transcript)
-        if not normalized:
-            return self.timing.turn_commit_default_wait_ms
-            
-        if _is_hard_interrupt_command(normalized):
-            return self.timing.turn_commit_hard_command_wait_ms
-            
-        if state.active_task_id:
-            return self.timing.turn_commit_active_task_wait_ms
-            
-        return self.timing.turn_commit_default_wait_ms
+        return self._turn_committer.classify_commit_delay(state)
 
     async def _handle_user_turn(self, state: VoiceSessionState, text: str) -> None:
         self._clear_interrupt_investigation(state)
@@ -425,13 +468,24 @@ class VoiceSessionOrchestrator:
             state.active_task_id = None
         state.delivered_result_generation = None
         
-        logging.info(f"User Turn Committed: {text}")
+        log_voice_event(
+            "turn_committed",
+            session_id=state.session_id,
+            transport=state.transport.value,
+            extra={"transcript_preview": text[:120]},
+        )
         self._append_history(state, "user", text)
         self._record_user_claim(state, text)
         system_state_str = self._build_system_state(state)
         
         decision = await self.llm_provider.route_turn(text, system_state_str, state.conversation_history[:-1])
         decision_type = decision.get("type")
+        log_voice_event(
+            "route_decision",
+            session_id=state.session_id,
+            transport=state.transport.value,
+            extra={"decision_type": decision_type},
+        )
         if decision_type == "assistant_response":
             response_text = decision.get("response") or "I understand."
             self._append_history(state, "assistant", response_text)
@@ -451,18 +505,15 @@ class VoiceSessionOrchestrator:
             try:
                 if self._has_active_codex_task(state):
                     conflict = self._codex_task_conflict_payload(state, str(task_text))
-                    self._append_history(state, "assistant", None, extra={
-                        "role": "assistant",
-                        "tool_calls": [{"id": tool_call_id, "type": "function", "function": {"name": "start_task", "arguments": json.dumps(args)}}],
-                    })
-                    self._append_history(state, "tool", json.dumps(conflict), extra={
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "name": "start_task",
-                    })
-                    response_text = await self._speak_user_turn_followup(state, text)
-                    self._append_history(state, "assistant", response_text)
-                    await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, response_text, task_id=state.active_task_id)
+                    await self._complete_tool_turn(
+                        state,
+                        user_text=text,
+                        tool_name="start_task",
+                        tool_call_id=tool_call_id,
+                        tool_args=args,
+                        tool_result=conflict,
+                        task_id=state.active_task_id,
+                    )
                     return
                 context = self._build_task_context(state, text)
                 logging.info("Voice router starting task with grounded request: %s", task_text)
@@ -478,33 +529,27 @@ class VoiceSessionOrchestrator:
                 state.last_task_status_seen = response.task.user_visible_status
                 state.delivered_result_generation = None
                 tool_call_id = f"call_{state.active_task_id}"
-                self._append_history(state, "assistant", None, extra={
-                    "role": "assistant",
-                    "tool_calls": [{"id": tool_call_id, "type": "function", "function": {"name": "start_task", "arguments": json.dumps(args)}}],
-                })
-                self._append_history(state, "tool", json.dumps(response.model_dump(mode="json")), extra={
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "name": "start_task",
-                })
-                response_text = await self._speak_user_turn_followup(state, text)
-                self._append_history(state, "assistant", response_text)
-                await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, response_text, task_id=state.active_task_id)
+                await self._complete_tool_turn(
+                    state,
+                    user_text=text,
+                    tool_name="start_task",
+                    tool_call_id=tool_call_id,
+                    tool_args=args,
+                    tool_result=response.model_dump(mode="json"),
+                    task_id=state.active_task_id,
+                )
             except TaskConflictError as exc:
                 conflict = self._codex_task_conflict_payload(state, str(args.get("task", text)))
                 conflict["details"] = str(exc)
-                self._append_history(state, "assistant", None, extra={
-                    "role": "assistant",
-                    "tool_calls": [{"id": tool_call_id, "type": "function", "function": {"name": "start_task", "arguments": json.dumps(args)}}],
-                })
-                self._append_history(state, "tool", json.dumps(conflict), extra={
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "name": "start_task",
-                })
-                response_text = await self._speak_user_turn_followup(state, text)
-                self._append_history(state, "assistant", response_text)
-                await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, response_text, task_id=state.active_task_id)
+                await self._complete_tool_turn(
+                    state,
+                    user_text=text,
+                    tool_name="start_task",
+                    tool_call_id=tool_call_id,
+                    tool_args=args,
+                    tool_result=conflict,
+                    task_id=state.active_task_id,
+                )
             except Exception as exc:
                 await self._emit_tool_failure_response(state, text, "start_task", tool_call_id, exc, args)
 
@@ -524,18 +569,15 @@ class VoiceSessionOrchestrator:
                 return
             try:
                 status = await self.controller.amend_task(task_id, AmendTaskRequest(amendment=amendment))
-                self._append_history(state, "assistant", None, extra={
-                    "role": "assistant",
-                    "tool_calls": [{"id": tool_call_id, "type": "function", "function": {"name": "amend_task", "arguments": json.dumps(args)}}],
-                })
-                self._append_history(state, "tool", json.dumps(status.model_dump(mode="json")), extra={
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "name": "amend_task",
-                })
-                msg = await self._speak_user_turn_followup(state, text)
-                self._append_history(state, "assistant", msg)
-                await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, msg, task_id=task_id)
+                await self._complete_tool_turn(
+                    state,
+                    user_text=text,
+                    tool_name="amend_task",
+                    tool_call_id=tool_call_id,
+                    tool_args=args,
+                    tool_result=status.model_dump(mode="json"),
+                    task_id=task_id,
+                )
             except Exception as exc:
                 await self._emit_tool_failure_response(state, text, "amend_task", tool_call_id, exc, args)
 
@@ -554,18 +596,15 @@ class VoiceSessionOrchestrator:
                 return
             try:
                 response = await self.controller.cancel_task(task_id, CancelTaskRequest(reason="User voice cancellation"))
-                self._append_history(state, "assistant", None, extra={
-                    "role": "assistant",
-                    "tool_calls": [{"id": tool_call_id, "type": "function", "function": {"name": "cancel_task", "arguments": json.dumps(args)}}],
-                })
-                self._append_history(state, "tool", json.dumps(response.model_dump(mode="json")), extra={
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "name": "cancel_task",
-                })
-                msg = await self._speak_user_turn_followup(state, text)
-                self._append_history(state, "assistant", msg)
-                await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, msg, task_id=task_id)
+                await self._complete_tool_turn(
+                    state,
+                    user_text=text,
+                    tool_name="cancel_task",
+                    tool_call_id=tool_call_id,
+                    tool_args=args,
+                    tool_result=response.model_dump(mode="json"),
+                    task_id=task_id,
+                )
                 if state.active_task_id == task_id:
                     state.active_task_id = None
             except Exception as exc:
@@ -578,18 +617,15 @@ class VoiceSessionOrchestrator:
             except Exception as exc:
                 await self._emit_tool_failure_response(state, text, tool_name, tool_call_id, exc, args)
                 return
-            self._append_history(state, "assistant", None, extra={
-                "role": "assistant",
-                "tool_calls": [{"id": tool_call_id, "type": "function", "function": {"name": tool_name, "arguments": json.dumps(args)}}],
-            })
-            self._append_history(state, "tool", json.dumps(result), extra={
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "name": tool_name,
-            })
-            assistant_response = await self._speak_user_turn_followup(state, text)
-            self._append_history(state, "assistant", assistant_response)
-            await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, assistant_response, task_id=state.active_task_id)
+            await self._complete_tool_turn(
+                state,
+                user_text=text,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                tool_args=args,
+                tool_result=result,
+                task_id=state.active_task_id,
+            )
                     
         else:
             await self._emit(state, VoiceEventType.ERROR, f"Unknown LLM decision: {tool_name}")
@@ -764,139 +800,50 @@ class VoiceSessionOrchestrator:
                 await self._maybe_deliver_timer_alert(state)
                 await self._maybe_emit_progress(state)
                 await self._maybe_deliver_result(state)
+                await self._maybe_expire_idle_session(state)
+                self._prune_delivery_records(state)
         except asyncio.CancelledError:
             raise
 
+    async def _maybe_expire_idle_session(self, state: VoiceSessionState) -> None:
+        if state.user_speaking or state.assistant_speaking or state.active_task_id:
+            return
+        last_activity = state.last_activity_at
+        if last_activity is None:
+            return
+        idle_limit = timedelta(minutes=self._settings.voice_session_idle_timeout_minutes)
+        if self.clock() - last_activity < idle_limit:
+            return
+        await self.stop_session(state.session_id)
+
+    def _prune_delivery_records(self, state: VoiceSessionState) -> None:
+        ttl = timedelta(minutes=self._settings.delivery_record_ttl_minutes)
+        cutoff = self.clock() - ttl
+        expired_ids = [
+            delivery_id
+            for delivery_id, record in state.delivery_records.items()
+            if record.emitted_at < cutoff and record.status in {"spoken", "interrupted"}
+        ]
+        for delivery_id in expired_ids:
+            state.delivery_records.pop(delivery_id, None)
+
     async def _poll_task_result(self, state: VoiceSessionState) -> None:
-        if state.active_task_id is None or state.queued_result is not None:
-            return
-        result = self.controller.read_result(state.active_task_id)
-        if result is None:
-            return
-        if result.status in {RuntimeResultStatus.CANCELLED, RuntimeResultStatus.STALE}:
-            return
-        state.queued_result = result
+        await self._delivery_manager.poll_task_result(state)
 
     async def _maybe_emit_progress(self, state: VoiceSessionState) -> None:
-        if self._has_pending_timer_delivery(state):
-            return
-        if state.active_task_id is None or state.queued_result is not None or state.task_started_at is None:
-            return
-
-        task = self.controller.tasks.get(state.active_task_id)
-        if task is None or task.status not in {TaskStatus.RUNNING, TaskStatus.AMENDING, TaskStatus.WAITING_FOR_APPROVAL}:
-            return
-        if state.user_speaking or state.assistant_speaking:
-            return
-
-        now = self.clock()
-        meaningful_progress = task.user_visible_status != state.last_task_status_seen
-        if meaningful_progress:
-            state.last_task_status_seen = task.user_visible_status
-
-        if state.next_progress_check_at is not None and now < state.next_progress_check_at:
-            return
-
-        state.progress_check_count += 1
-        state.next_progress_check_at = now + timedelta(milliseconds=self._normalize_next_progress_check(None))
+        await self._delivery_manager.maybe_emit_progress(state)
 
     async def _maybe_deliver_timer_alert(self, state: VoiceSessionState) -> None:
-        if state.user_speaking or state.assistant_speaking:
-            return
-        record = self._next_pending_timer_delivery(state)
-        if record is None:
-            return
-        answer = await self._speak_background_event(state, record.original_request, BACKGROUND_TIMER_INSTRUCTION)
-        record.status = "speaking"
-        record.text = answer
-        self._append_history(state, "assistant", answer)
-        await self._emit(
-            state,
-            VoiceEventType.ASSISTANT_RESPONSE,
-            answer,
-            metadata={
-                "durable": True,
-                "delivery_id": record.delivery_id,
-                "utterance_id": record.delivery_id,
-                "event_type": VoiceEventType.ASSISTANT_RESPONSE.value,
-                "delivery_kind": record.kind,
-            },
-        )
-
-    def _next_pending_timer_delivery(self, state: VoiceSessionState) -> DeliveryRecord | None:
-        pending = [
-            record
-            for record in state.delivery_records.values()
-            if record.kind == "timer" and record.status in {"emitted", "interrupted"}
-        ]
-        if not pending:
-            return None
-        pending.sort(key=lambda record: record.emitted_at)
-        return pending[0]
+        await self._delivery_manager.maybe_deliver_timer_alert(state)
 
     def _has_pending_timer_delivery(self, state: VoiceSessionState) -> bool:
-        return self._next_pending_timer_delivery(state) is not None
-
-    def _normalize_next_progress_check(self, next_check_ms: object) -> int:
-        if isinstance(next_check_ms, int | float) and next_check_ms > 0:
-            return int(next_check_ms)
-        if self.timing.repeated_progress_check_max_ms <= self.timing.repeated_progress_check_min_ms:
-            return self.timing.repeated_progress_check_min_ms
-        return random.randint(self.timing.repeated_progress_check_min_ms, self.timing.repeated_progress_check_max_ms)
+        return self._delivery_manager.has_pending_timer_delivery(state)
 
     async def _maybe_deliver_result(self, state: VoiceSessionState) -> None:
-        result = state.queued_result
-        if result is None or state.user_speaking or state.assistant_speaking:
-            return
-
-        if self.timing.assistant_ack_timeout_ms > 0 and state.recent_assistant_utterances:
-            last_emitted_at, _ = state.recent_assistant_utterances[-1]
-            if state.assistant_speech_started_at is None or state.assistant_speech_started_at < last_emitted_at:
-                elapsed = self._elapsed_ms(last_emitted_at)
-                if elapsed < self.timing.assistant_ack_timeout_ms:
-                    return
-
-        if state.delivered_result_generation == result.generation:
-            return
-
-        self._append_tool_result_history(state, result)
-        task = self.controller.tasks.get(result.task_id)
-        user_text = task.original_request if task else result.task_id
-        answer = await self._speak_background_event(state, user_text, BACKGROUND_RESEARCH_INSTRUCTION)
-        self._append_history(state, "assistant", answer)
-        delivery = self._create_delivery_record(
+        await self._delivery_manager.maybe_deliver_result(
             state,
-            delivery_id=f"delivery_{result.task_id}_{result.generation}",
-            kind="background_task",
-            task_id=result.task_id,
-            generation=result.generation,
-            text=answer,
-            original_request=task.original_request if task else result.task_id,
+            append_tool_result_history=self._append_tool_result_history,
         )
-        await self._emit(
-            state,
-            VoiceEventType.DELIVERY_READY,
-            answer,
-            task_id=result.task_id,
-            metadata={
-                "durable": True,
-                "delivery_id": delivery.delivery_id,
-                "utterance_id": delivery.delivery_id,
-                "event_type": VoiceEventType.DELIVERY_READY.value,
-            },
-        )
-        state.delivered_result_generation = result.generation
-        state.recent_completed_events.append({
-            "type": "background_task",
-            "task_id": result.task_id,
-            "status": result.status.value,
-            "completed_at": self._iso_now(),
-            "delivery_id": delivery.delivery_id,
-            "delivery_status": delivery.status,
-        })
-        state.recent_completed_events = state.recent_completed_events[-10:]
-        state.queued_result = None
-        state.active_task_id = None
 
     async def _speak_user_turn_followup(self, state: VoiceSessionState, user_text: str) -> str:
         return await self._speak_from_state(state, USER_TURN_FOLLOWUP_INSTRUCTION, user_text)
@@ -940,24 +887,60 @@ class VoiceSessionOrchestrator:
             "allowed_next_actions": [],
         }
 
-    def _record_tool_failure(
+    async def _complete_tool_turn(
         self,
         state: VoiceSessionState,
+        *,
+        user_text: str,
         tool_name: str,
         tool_call_id: str,
-        exc: Exception | str,
-        args: dict[str, Any],
-    ) -> None:
-        payload = self._tool_failure_payload(exc, tool_name)
+        tool_args: dict[str, Any],
+        tool_result: dict[str, Any],
+        task_id: str | None = None,
+    ) -> str:
         self._append_history(state, "assistant", None, extra={
             "role": "assistant",
-            "tool_calls": [{"id": tool_call_id, "type": "function", "function": {"name": tool_name, "arguments": json.dumps(args)}}],
+            "tool_calls": [{
+                "id": tool_call_id,
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": json.dumps(tool_args),
+                },
+            }],
         })
-        self._append_history(state, "tool", json.dumps(payload), extra={
+        self._append_history(state, "tool", json.dumps(tool_result), extra={
             "role": "tool",
             "tool_call_id": tool_call_id,
             "name": tool_name,
         })
+        response_text = await self._speak_user_turn_followup(state, user_text)
+        self._append_history(state, "assistant", response_text)
+        await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, response_text, task_id=task_id)
+        return response_text
+
+    async def _emit_durable_spoken_delivery(
+        self,
+        state: VoiceSessionState,
+        *,
+        instruction: str,
+        user_text: str | None,
+        event_type: VoiceEventType,
+        task_id: str | None,
+        delivery_id: str,
+        delivery_kind: str,
+        extra_metadata: dict[str, object] | None = None,
+    ) -> str:
+        return await self._delivery_manager.emit_durable_spoken_delivery(
+            state,
+            instruction=instruction,
+            user_text=user_text,
+            event_type=event_type,
+            task_id=task_id,
+            delivery_id=delivery_id,
+            delivery_kind=delivery_kind,
+            extra_metadata=extra_metadata,
+        )
 
     async def _emit_tool_failure_response(
         self,
@@ -968,20 +951,19 @@ class VoiceSessionOrchestrator:
         exc: Exception | str,
         args: dict[str, Any],
     ) -> None:
-        self._record_tool_failure(state, tool_name, tool_call_id, exc, args)
-        response_text = await self._speak_user_turn_followup(state, user_text)
-        self._append_history(state, "assistant", response_text)
-        await self._emit(state, VoiceEventType.ASSISTANT_RESPONSE, response_text, task_id=state.active_task_id)
+        payload = self._tool_failure_payload(exc, tool_name)
+        await self._complete_tool_turn(
+            state,
+            user_text=user_text,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            tool_args=args,
+            tool_result=payload,
+            task_id=state.active_task_id,
+        )
 
     def _append_tool_result_history(self, state: VoiceSessionState, result: RuntimeResult) -> None:
-        tool_call_id = f"result_{result.task_id}"
-        if any(msg.get("role") == "tool" and msg.get("tool_call_id") == tool_call_id for msg in state.conversation_history):
-            return
-        self._append_history(state, "tool", json.dumps(result.model_dump(mode="json")), extra={
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "name": "start_task",
-        })
+        self._conversation_history.append_tool_result_history(state, result)
 
     def _append_history(
         self,
@@ -990,19 +972,13 @@ class VoiceSessionOrchestrator:
         content: str | None,
         extra: dict[str, Any] | None = None,
     ) -> None:
-        message = dict(extra or {})
-        message["role"] = role
-        if content is not None:
-            message["content"] = content
-        message["timestamp"] = self._iso_now()
-        state.conversation_history.append(message)
+        self._conversation_history.append_history(state, role, content, extra)
 
     def _iso_now(self) -> str:
-        return self.clock().astimezone().isoformat()
+        return self._conversation_history.iso_now()
 
     def _build_system_state(self, state: VoiceSessionState) -> str:
-        active_task_id = state.active_task_id or "None"
-        return f"Active Task ID: {active_task_id}\nStructured Session State:\n{json.dumps(self._session_state_payload(state), default=str, indent=2)}"
+        return self._conversation_history.build_system_state(state)
 
     def _session_state_payload(self, state: VoiceSessionState) -> dict[str, Any]:
         now = self.clock()
@@ -1041,56 +1017,57 @@ class VoiceSessionOrchestrator:
         text: str,
         original_request: str,
     ) -> DeliveryRecord:
-        record = DeliveryRecord(
+        return self._delivery_manager.create_delivery_record(
+            state,
             delivery_id=delivery_id,
             kind=kind,
             task_id=task_id,
             generation=generation,
             text=text,
             original_request=original_request,
-            emitted_at=self.clock(),
         )
-        state.delivery_records[delivery_id] = record
-        return record
 
-    def _mark_delivery_speaking(self, state: VoiceSessionState, metadata: dict[str, Any]) -> None:
-        delivery_id = metadata.get("delivery_id")
+    def _mark_delivery_speaking(
+        self,
+        state: VoiceSessionState,
+        metadata: dict[str, Any] | AssistantSpeechStartedMetadata,
+    ) -> None:
+        delivery_id = metadata.delivery_id if isinstance(metadata, AssistantSpeechStartedMetadata) else metadata.get("delivery_id")
+        if not delivery_id:
+            utterance_id = metadata.utterance_id if isinstance(metadata, AssistantSpeechStartedMetadata) else metadata.get("utterance_id")
+            delivery_id = utterance_id
         if not delivery_id:
             return
         record = state.delivery_records.get(str(delivery_id))
         if record and record.status != "spoken":
             record.status = "speaking"
 
-    def _mark_delivery_speech_ended(self, state: VoiceSessionState, metadata: dict[str, Any]) -> None:
-        delivery_id = metadata.get("delivery_id")
+    def _mark_delivery_speech_ended(
+        self,
+        state: VoiceSessionState,
+        metadata: dict[str, Any] | AssistantSpeechEndedMetadata,
+    ) -> None:
+        delivery_id = metadata.delivery_id if isinstance(metadata, AssistantSpeechEndedMetadata) else metadata.get("delivery_id")
+        if not delivery_id:
+            utterance_id = metadata.utterance_id if isinstance(metadata, AssistantSpeechEndedMetadata) else metadata.get("utterance_id")
+            delivery_id = utterance_id
         if not delivery_id:
             return
         record = state.delivery_records.get(str(delivery_id))
         if record is None:
             return
-        completed = metadata.get("completed")
+        completed = metadata.completed if isinstance(metadata, AssistantSpeechEndedMetadata) else metadata.get("completed")
         if completed is True:
             record.status = "spoken"
             record.reason = None
             record.spoken_at = self.clock()
             return
+        reason = metadata.reason if isinstance(metadata, AssistantSpeechEndedMetadata) else metadata.get("reason")
         record.status = "interrupted"
-        record.reason = str(metadata.get("reason") or "interrupted")
+        record.reason = str(reason or "interrupted")
 
     def _delivery_payload(self, record: DeliveryRecord) -> dict[str, Any]:
-        return {
-            "delivery_id": record.delivery_id,
-            "kind": record.kind,
-            "task_id": record.task_id,
-            "generation": record.generation,
-            "original_request": record.original_request,
-            "text": record.text,
-            "status": record.status,
-            "reason": record.reason,
-            "emitted_at": record.emitted_at.astimezone().isoformat(),
-            "durable": True,
-            "instruction": "This durable result was emitted but not confirmed heard by the user. Do not claim it was already delivered.",
-        }
+        return self._delivery_manager.delivery_payload(record)
 
     def _has_active_codex_task(self, state: VoiceSessionState) -> bool:
         if not state.active_task_id:
@@ -1189,135 +1166,10 @@ class VoiceSessionOrchestrator:
         }
 
     async def _execute_native_tool(self, state: VoiceSessionState, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
-        if tool_name == "start_timer":
-            duration_ms = int(args["duration_ms"])
-            timer = SessionTimer(
-                timer_id=f"timer_{len(state.active_timers) + 1:03d}",
-                label=str(args.get("label") or "timer"),
-                duration_ms=duration_ms,
-                reason=str(args["reason"]) if args.get("reason") is not None else None,
-                started_at=self.clock(),
-                ui_title=args.get("ui_title"),
-            )
-            state.active_timers[timer.timer_id] = timer
-            return {"timer": self._timer_payload(timer, self.clock()), "message": f"I started the {timer.label} timer."}
-        if tool_name == "list_active_timers":
-            return {"timers": [self._timer_payload(timer, self.clock()) for timer in state.active_timers.values() if timer.status == "running"]}
-        if tool_name == "get_timer_status":
-            timer = self._select_timer(state, args.get("timer_id"))
-            return {"timer": self._timer_payload(timer, self.clock()), "message": self._timer_status_message(timer)}
-        if tool_name == "cancel_timer":
-            timer = self._select_timer(state, args.get("timer_id"))
-            timer.status = "cancelled"
-            return {"timer": self._timer_payload(timer, self.clock()), "message": f"I cancelled the {timer.label} timer."}
-        if tool_name == "start_activity":
-            activity = SessionActivity(
-                activity_id=f"activity_{len(state.active_activities) + 1:03d}",
-                activity_type=str(args.get("activity_type") or "activity"),
-                label=str(args.get("label") or args.get("activity_type") or "activity"),
-                target_duration_ms=int(args["target_duration_ms"]) if args.get("target_duration_ms") is not None else None,
-                target_distance_meters=int(args["target_distance_meters"]) if args.get("target_distance_meters") is not None else None,
-                started_at=self.clock(),
-                ui_title=args.get("ui_title"),
-            )
-            state.active_activities[activity.activity_id] = activity
-            return {"activity": self._activity_payload(activity, self.clock()), "message": f"I started tracking {activity.label}."}
-        if tool_name == "list_active_activities":
-            return {"activities": [self._activity_payload(activity, self.clock()) for activity in state.active_activities.values() if activity.status == "active"]}
-        if tool_name == "get_activity_status":
-            activity = self._select_activity(state, args.get("activity_id"))
-            return {"activity": self._activity_payload(activity, self.clock()), "message": f"{activity.label} is still active."}
-        if tool_name == "end_activity":
-            activity = self._select_activity(state, args.get("activity_id"))
-            rejection = self._reject_obviously_invalid_activity_completion(activity, self.clock())
-            if rejection is not None:
-                return rejection
-            activity.status = "completed"
-            payload = self._activity_payload(activity, self.clock())
-            state.recent_completed_events.append({"type": "activity", "activity": payload, "completed_at": self._iso_now()})
-            state.recent_completed_events = state.recent_completed_events[-10:]
-            return {"activity": payload, "message": f"I marked {activity.label} complete."}
-        if tool_name == "cancel_activity":
-            activity = self._select_activity(state, args.get("activity_id"))
-            activity.status = "cancelled"
-            return {"activity": self._activity_payload(activity, self.clock()), "message": f"I cancelled tracking {activity.label}."}
-        if tool_name == "list_active_background_tasks":
-            return {"tasks": [self._task_payload(state, task, self.clock()) for task in self.controller.tasks.values() if task.status in {TaskStatus.RUNNING, TaskStatus.AMENDING, TaskStatus.WAITING_FOR_APPROVAL}]}
-        if tool_name == "get_background_task_status":
-            task_id = str(args.get("task_id") or state.active_task_id or "")
-            status = self.controller.get_status(task_id)
-            return {"task": status.task.model_dump(mode="json"), "progress": status.progress, "message": status.progress or status.task.user_visible_status}
-        if tool_name == "cancel_background_task":
-            task_id = str(args.get("task_id") or state.active_task_id or "")
-            response = await self.controller.cancel_task(task_id, CancelTaskRequest(reason=str(args.get("reason") or "User voice cancellation")))
-            if state.active_task_id == task_id:
-                state.active_task_id = None
-            return response.model_dump(mode="json") | {"message": "I stopped that task."}
-        raise ValueError(f"Unknown native tool: {tool_name}")
-
-    def _select_timer(self, state: VoiceSessionState, timer_id: object) -> SessionTimer:
-        if timer_id:
-            timer = state.active_timers.get(str(timer_id))
-            if timer:
-                return timer
-            raise ValueError(f"Timer {timer_id} was not found.")
-        active = [timer for timer in state.active_timers.values() if timer.status == "running"]
-        if len(active) == 1:
-            return active[0]
-        raise ValueError("I need to know which timer.")
-
-    def _select_activity(self, state: VoiceSessionState, activity_id: object) -> SessionActivity:
-        if activity_id:
-            activity = state.active_activities.get(str(activity_id))
-            if activity:
-                return activity
-            raise ValueError(f"Activity {activity_id} was not found.")
-        active = [activity for activity in state.active_activities.values() if activity.status == "active"]
-        if len(active) == 1:
-            return active[0]
-        raise ValueError("I need to know which activity.")
-
-    def _reject_obviously_invalid_activity_completion(
-        self,
-        activity: SessionActivity,
-        now: datetime,
-    ) -> dict[str, Any] | None:
-        payload = self._activity_payload(activity, now)
-        elapsed_ms = int(payload["elapsed_ms"])
-        if activity.target_duration_ms is not None and elapsed_ms < activity.target_duration_ms:
-            return {
-                "ok": False,
-                "error_code": "activity_completion_too_early",
-                "reason": "The tracked activity duration has not elapsed yet.",
-                "activity": payload,
-                "elapsed_ms": elapsed_ms,
-                "target_duration_ms": activity.target_duration_ms,
-            }
-        if activity.target_distance_meters is None or elapsed_ms <= 0:
-            return None
-        elapsed_seconds = elapsed_ms / 1000
-        speed_mps = activity.target_distance_meters / elapsed_seconds
-        if speed_mps <= 12:
-            return None
-        return {
-            "ok": False,
-            "error_code": "activity_completion_physically_implausible",
-            "reason": "The tracked distance and elapsed time imply an impossible pace.",
-            "activity": payload,
-            "elapsed_ms": elapsed_ms,
-            "target_distance_meters": activity.target_distance_meters,
-            "implied_speed_mps": round(speed_mps, 1),
-        }
-
-    def _timer_status_message(self, timer: SessionTimer) -> str:
-        payload = self._timer_payload(timer, self.clock())
-        remaining = int(payload["remaining_ms"] / 1000)
-        if remaining <= 0:
-            return f"The {timer.label} timer is done."
-        return f"The {timer.label} timer still has about {remaining} seconds left."
+        return await self._native_tool_executor.execute(state, tool_name, args)
 
     def _record_user_claim(self, state: VoiceSessionState, text: str) -> None:
-        normalized = _normalize_turn_text(text)
+        normalized = normalize_turn_text(text)
         claim_type = None
         if any(word in normalized.split() for word in {"finished", "done", "completed"}):
             claim_type = "completion_claim"
@@ -1349,33 +1201,7 @@ class VoiceSessionOrchestrator:
         return int((later - earlier) / timedelta(milliseconds=1))
 
     def _build_task_context(self, state: VoiceSessionState, current_user_text: str) -> str:
-        prior_results: list[dict[str, Any]] = []
-        transcript_lines: list[str] = []
-        for msg in state.conversation_history:
-            role = msg.get("role")
-            content = msg.get("content")
-            if role == "tool" and msg.get("name") == "start_task" and isinstance(content, str):
-                try:
-                    payload = json.loads(content)
-                except json.JSONDecodeError:
-                    transcript_lines.append(f"Tool: {content}")
-                    continue
-                if isinstance(payload, dict) and "status" in payload:
-                    prior_results.append(payload)
-                    continue
-            if role == "assistant" and "tool_calls" in msg:
-                transcript_lines.append(f"Assistant tool call: {json.dumps(msg.get('tool_calls'))}")
-            elif content is not None:
-                transcript_lines.append(f"{str(role or 'message').capitalize()}: {content}")
-
-        sections = ["Current user request:", current_user_text]
-        if prior_results:
-            sections.append("\nPrior completed tool results to preserve when relevant:")
-            for index, result in enumerate(prior_results, start=1):
-                sections.append(f"Prior result {index}: {json.dumps(result)}")
-        sections.append("\nConversation transcript:")
-        sections.extend(transcript_lines or ["No previous conversation turns."])
-        return "\n".join(sections)
+        return self._conversation_history.build_task_context(state, current_user_text)
 
     async def _emit(
         self,
@@ -1391,6 +1217,8 @@ class VoiceSessionOrchestrator:
             "voice_state": state.voice_state,
         }
         if metadata:
+            if metadata.get("durable") is True:
+                DurableDeliveryMetadata.model_validate(metadata)
             event_metadata.update(metadata)
         event = VoiceEvent(
             event=event_type,
@@ -1492,25 +1320,10 @@ class VoiceSessionOrchestrator:
         text: str,
         stt_confidence: float | None,
     ) -> ActiveVadClassification:
-        del stt_confidence
-        if not text.strip():
-            return ActiveVadClassification.NO_TRANSCRIPT
-        normalized = _normalize_turn_text(text)
-        if self._assistant_echo_reason(state, normalized):
-            return ActiveVadClassification.ECHO_LIKE
-        return ActiveVadClassification.DIVERGENT_TEXT
+        return self._interrupt_manager.classify_active_vad_text(state, text, stt_confidence)
 
     def _classify_post_vad_commit(self, state: VoiceSessionState, text: str) -> PostVadClassification:
-        normalized = _normalize_turn_text(text)
-        if not normalized:
-            return PostVadClassification.NO_TRANSCRIPT
-        if self._assistant_echo_reason(state, normalized):
-            return PostVadClassification.ECHO
-        if _is_hard_interrupt_command(normalized):
-            return PostVadClassification.GENUINE
-        if _passes_min_evidence(normalized, self.timing):
-            return PostVadClassification.GENUINE
-        return PostVadClassification.WEAK
+        return self._interrupt_manager.classify_post_vad_commit(state, text)
 
     def _update_active_vad_candidate(
         self,
@@ -1672,7 +1485,7 @@ class VoiceSessionOrchestrator:
         during_assistant: bool | None = None,
         during_cooldown: bool | None = None,
     ) -> tuple[bool, str]:
-        normalized = _normalize_turn_text(text)
+        normalized = normalize_turn_text(text)
         if not normalized:
             return False, "empty_transcript"
 
@@ -1681,10 +1494,10 @@ class VoiceSessionOrchestrator:
         during_cooldown = self._in_post_tts_cooldown(state) if during_cooldown is None else during_cooldown
         echo_reason = self._assistant_echo_reason(state, normalized)
         echo = echo_reason is not None
-        if _is_hard_interrupt_command(normalized):
+        if is_hard_interrupt_command(normalized):
             return (False, echo_reason or "matches_recent_assistant_text") if echo else (True, "hard_interrupt_command")
 
-        if recent and _is_soft_amendment_marker_only(normalized):
+        if recent and is_soft_amendment_marker_only(normalized):
             return False, "ambiguous_soft_marker_after_tts"
 
         if (during_assistant or during_cooldown or recent) and echo:
@@ -1714,7 +1527,11 @@ class VoiceSessionOrchestrator:
     def _assistant_echo_reason(self, state: VoiceSessionState, normalized_text: str) -> str | None:
         self._prune_recent_assistant_utterances(state)
         for _, assistant_text in state.recent_assistant_utterances:
-            reason = _assistant_echo_match_reason(normalized_text, _normalize_turn_text(assistant_text), self.timing)
+            reason = InterruptManager.assistant_echo_match_reason(
+                normalized_text,
+                normalize_turn_text(assistant_text),
+                self.timing,
+            )
             if reason:
                 return reason
         return None
@@ -1732,52 +1549,3 @@ class VoiceSessionOrchestrator:
             for item in state.recent_assistant_utterances
             if self._elapsed_ms(item[0]) <= self.timing.recent_assistant_window_ms
         ]
-
-
-def _passes_min_evidence(normalized: str, timing: VoiceTimingConfig) -> bool:
-    words = normalized.split()
-    return len(words) >= timing.min_interrupt_words or len(normalized) >= timing.min_interrupt_chars
-
-
-def _normalize_turn_text(text: str) -> str:
-    return " ".join(re.sub(r"[^a-z0-9\s]", " ", text.lower()).split())
-
-
-def _is_hard_interrupt_command(normalized: str) -> bool:
-    return normalized in HARD_INTERRUPT_COMMANDS
-
-
-def _is_soft_amendment_marker_only(normalized: str) -> bool:
-    return normalized in SOFT_AMENDMENT_MARKERS
-
-
-def _assistant_echo_match_reason(
-    normalized_text: str,
-    normalized_assistant_text: str,
-    timing: VoiceTimingConfig,
-) -> str | None:
-    if not normalized_text or not normalized_assistant_text:
-        return None
-    if normalized_text == normalized_assistant_text:
-        return "matches_recent_assistant_text"
-    text_words = normalized_text.split()
-    assistant_words = normalized_assistant_text.split()
-    if len(text_words) <= timing.short_transcript_max_words and assistant_words[: len(text_words)] == text_words:
-        return "short_prefix_echo"
-    if len(normalized_text) >= 12 and normalized_text in normalized_assistant_text:
-        return "matches_recent_assistant_text"
-    if len(normalized_assistant_text) >= 12 and normalized_assistant_text in normalized_text:
-        return "contains_recent_assistant_text"
-
-    similarity = SequenceMatcher(None, normalized_text, normalized_assistant_text).ratio()
-    if similarity >= timing.fuzzy_similarity_threshold:
-        return "fuzzy_recent_assistant_match"
-
-    text_tokens = set(text_words)
-    assistant_tokens = set(assistant_words)
-    if len(text_tokens) < 3 or len(assistant_tokens) < 3:
-        return None
-    overlap = len(text_tokens & assistant_tokens) / min(len(text_tokens), len(assistant_tokens))
-    if overlap >= timing.token_overlap_threshold:
-        return "token_overlap_recent_assistant"
-    return None

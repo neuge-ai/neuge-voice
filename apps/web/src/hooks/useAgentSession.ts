@@ -125,6 +125,53 @@ export function useAgentSession() {
   const [activeTask, setActiveTask] = useState<Task | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  const buildSpeechMetadata = useCallback(
+    (item: TtsQueueItem, completed: boolean, reason?: string): Record<string, unknown> => ({
+      ...item.metadata,
+      source: "tts_queue",
+      utterance_id: item.id,
+      completed,
+      ...(reason ? { reason } : {}),
+    }),
+    [],
+  );
+
+  const reportSpeechStarted = useCallback(
+    (item: TtsQueueItem, sourceOverride?: string) => {
+      item.started = true;
+      setAssistantSpeaking(true);
+      void transport.send({
+        event: "assistant_speech_started",
+        metadata: sourceOverride
+          ? { ...buildSpeechMetadata(item, false), source: sourceOverride }
+          : buildSpeechMetadata(item, false),
+      });
+    },
+    [transport, buildSpeechMetadata],
+  );
+
+  const reportSpeechEnded = useCallback(
+    (item: TtsQueueItem, completed: boolean, reason?: string, sourceOverride?: string) => {
+      setAssistantSpeaking(false);
+      void transport.send({
+        event: "assistant_speech_ended",
+        metadata: sourceOverride
+          ? { ...buildSpeechMetadata(item, completed, reason), source: sourceOverride }
+          : buildSpeechMetadata(item, completed, reason),
+      });
+    },
+    [transport, buildSpeechMetadata],
+  );
+
+  const reportDurableInterrupted = useCallback(
+    (item: TtsQueueItem, reason: string) => {
+      if (item.metadata.durable === true) {
+        reportSpeechEnded(item, false, reason);
+      }
+    },
+    [reportSpeechEnded],
+  );
+
   const flushTtsQueue = useCallback(() => {
     const flushed = ttsQueue.current.flush();
     for (const item of flushed) {
@@ -132,18 +179,15 @@ export function useAgentSession() {
         void transport.send({
           event: "assistant_speech_ended",
           metadata: {
-            ...item.metadata,
+            ...buildSpeechMetadata(item, false, "interrupted_before_playback"),
             source: "flush",
-            utterance_id: item.id,
-            completed: false,
-            reason: "interrupted_before_playback",
           },
         });
       }
     }
     setAssistantSpeaking(false);
     ttsPausedRef.current = false;
-  }, [transport]);
+  }, [transport, buildSpeechMetadata]);
 
   const stopCurrentSpeech = useCallback(() => {
     flushTtsQueue();
@@ -176,21 +220,8 @@ export function useAgentSession() {
 
   const playTtsItem = useCallback(
     async (item: TtsQueueItem): Promise<void> => {
-      const speechMetadata = (completed: boolean, reason?: string): Record<string, unknown> => ({
-        ...item.metadata,
-        source: "tts_queue",
-        utterance_id: item.id,
-        completed,
-        ...(reason ? { reason } : {}),
-      });
-      const reportInterrupted = (reason: string) => {
-        if (item.metadata.durable === true) {
-          void transport.send({ event: "assistant_speech_ended", metadata: speechMetadata(false, reason) });
-        }
-      };
-
       if (item.cancelled) {
-        reportInterrupted("interrupted_before_playback");
+        reportDurableInterrupted(item, "interrupted_before_playback");
         return;
       }
 
@@ -212,7 +243,7 @@ export function useAgentSession() {
           cancelledBeforePlayback,
         ]);
         if (synthesis === "cancelled") {
-          reportInterrupted("interrupted_before_playback");
+          reportDurableInterrupted(item, "interrupted_before_playback");
           return;
         }
         result = synthesis;
@@ -223,7 +254,7 @@ export function useAgentSession() {
       }
 
       if (item.cancelled) {
-        reportInterrupted("interrupted_before_playback");
+        reportDurableInterrupted(item, "interrupted_before_playback");
         return;
       }
 
@@ -238,12 +269,12 @@ export function useAgentSession() {
 
         item.cancel = () => {
           item.cancelled = true;
-          reportInterrupted(item.started ? "interrupted" : "interrupted_before_playback");
+          reportDurableInterrupted(item, item.started ? "interrupted" : "interrupted_before_playback");
           resolveOnce();
         };
 
         if (item.cancelled) {
-          reportInterrupted("interrupted_before_playback");
+          reportDurableInterrupted(item, "interrupted_before_playback");
           resolveOnce();
           return;
         }
@@ -260,19 +291,20 @@ export function useAgentSession() {
               const source = transport.audioContext.createMediaElementSource(a);
               source.connect(transport.audioContext.destination);
               a.onplay = () => {
-                item.started = true;
-                setAssistantSpeaking(true);
-                void transport.send({ event: "assistant_speech_started", metadata: speechMetadata(false) });
+                reportSpeechStarted(item);
               };
               const finish = () => {
                 if (resolved) return;
-                setAssistantSpeaking(false);
                 audioRef.current = null;
                 if (audioObjectUrlRef.current === url) {
                   URL.revokeObjectURL(url);
                   audioObjectUrlRef.current = null;
                 }
-                void transport.send({ event: "assistant_speech_ended", metadata: speechMetadata(completedNaturally, completedNaturally ? undefined : "interrupted") });
+                reportSpeechEnded(
+                  item,
+                  completedNaturally,
+                  completedNaturally ? undefined : "interrupted",
+                );
                 resolveOnce();
               };
               item.cancel = () => {
@@ -322,15 +354,17 @@ export function useAgentSession() {
           utterance.volume = 1;
           utteranceRef.current = utterance;
           utterance.onstart = () => {
-            item.started = true;
-            setAssistantSpeaking(true);
-            void transport.send({ event: "assistant_speech_started", metadata: { ...speechMetadata(false), source: "speech_synthesis" } });
+            reportSpeechStarted(item, "speech_synthesis");
           };
           const finish = () => {
             if (resolved) return;
-            setAssistantSpeaking(false);
             utteranceRef.current = null;
-            void transport.send({ event: "assistant_speech_ended", metadata: { ...speechMetadata(completedNaturally, completedNaturally ? undefined : "interrupted"), source: "speech_synthesis" } });
+            reportSpeechEnded(
+              item,
+              completedNaturally,
+              completedNaturally ? undefined : "interrupted",
+              "speech_synthesis",
+            );
             resolveOnce();
           };
           item.cancel = () => {
@@ -366,7 +400,7 @@ export function useAgentSession() {
         }
       });
     },
-    [transport],
+    [reportDurableInterrupted, reportSpeechEnded, reportSpeechStarted],
   );
 
   const handleOutboundVoiceEvents = useCallback(

@@ -18,12 +18,24 @@ from nextgen_voice_agent.models.task import (
 )
 from nextgen_voice_agent.models.voice import VoiceEvent, VoiceTransportKind
 from nextgen_voice_agent.config import get_settings
-from nextgen_voice_agent.server.dependencies import get_controller, get_tts_provider, get_voice_orchestrator
+from nextgen_voice_agent.server.codex_app_server import CodexAppServerService
+from nextgen_voice_agent.server.dependencies import (
+    get_codex_app_server_service,
+    get_controller,
+    get_tts_provider,
+    get_voice_orchestrator,
+    get_webrtc_session_manager,
+)
 from nextgen_voice_agent.server.realtime import build_realtime_session_config, create_openai_realtime_client_secret
+from nextgen_voice_agent.transports.webrtc import WebRTCSessionManager
 from nextgen_voice_agent.voice.orchestrator import VoiceSessionOrchestrator
+from nextgen_voice_agent.voice.realtime_dispatch import (
+    call_realtime_codex_tool,
+    call_realtime_native_tool,
+    is_realtime_codex_tool,
+    is_realtime_native_tool,
+)
 from nextgen_voice_agent.voice.tts import TtsProvider, TtsProviderError, TtsRequest, TtsResult
-
-from . import codex_app_server
 
 router = APIRouter()
 
@@ -84,75 +96,10 @@ async def call_realtime_tool(
 ) -> dict[str, object]:
     args = request.arguments
     try:
-        if tool_name == "start_codex_task":
-            task_text = str(args["task"])
-            try:
-                result = await controller.start_task(
-                    StartTaskRequest(
-                        task=task_text,
-                        context=args.get("context") if args.get("context") else None,
-                        ui_title=str(args["ui_title"]) if args.get("ui_title") else None,
-                    )
-                )
-                return {"ok": True, **result.model_dump(mode="json")}
-            except TaskConflictError:
-                active_task = controller.tasks.get(controller.active_task_id or "")
-                return {
-                    "ok": False,
-                    "error_code": "codex_task_conflict",
-                    "recoverable": True,
-                    "message": "A Codex task is already active.",
-                    "attempted_task": task_text,
-                    "active_task": active_task.model_dump(mode="json") if active_task else None,
-                    "allowed_next_actions": [
-                        "amend_active_task",
-                        "cancel_active_task",
-                        "keep_active_task",
-                        "use_native_tool",
-                        "answer_directly",
-                    ],
-                }
-        if tool_name == "amend_codex_task":
-            result = await controller.amend_task(
-                str(args["task_id"]),
-                AmendTaskRequest(amendment=str(args["amendment"])),
-            )
-            return result.model_dump(mode="json")
-        if tool_name == "cancel_codex_task":
-            result = await controller.cancel_task(
-                str(args["task_id"]),
-                CancelTaskRequest(reason=str(args.get("reason") or "Cancelled from Realtime tool.")),
-            )
-            return result.model_dump(mode="json")
-        if tool_name == "get_codex_task_status":
-            return controller.get_status(str(args["task_id"])).model_dump(mode="json")
-        if tool_name == "read_codex_result":
-            result = controller.read_result(str(args["task_id"]))
-            return {"result": result.model_dump(mode="json") if result else None}
-        if tool_name == "approve_codex_action":
-            result = await controller.approve_action(
-                str(args["task_id"]),
-                str(args["action_id"]),
-                bool(args["approved"]),
-            )
-            return result.model_dump(mode="json")
-        if tool_name in {
-            "start_timer",
-            "get_timer_status",
-            "list_active_timers",
-            "cancel_timer",
-            "start_activity",
-            "get_activity_status",
-            "list_active_activities",
-            "end_activity",
-            "cancel_activity",
-            "list_active_background_tasks",
-            "get_background_task_status",
-            "cancel_background_task",
-        }:
-            state = await orchestrator.start_session("realtime-default", VoiceTransportKind.BROWSER)
-            normalized_args = {key: value for key, value in args.items() if value is not None}
-            return await orchestrator._execute_native_tool(state, tool_name, normalized_args)
+        if is_realtime_codex_tool(tool_name):
+            return await call_realtime_codex_tool(tool_name, args, controller)
+        if is_realtime_native_tool(tool_name):
+            return await call_realtime_native_tool(tool_name, args, orchestrator)
     except KeyError as exc:
         raise HTTPException(status_code=422, detail=f"Missing required argument: {exc.args[0]}") from exc
     except TaskNotFoundError as exc:
@@ -253,7 +200,7 @@ async def get_voice_session_events(
     session_id: str,
     orchestrator: VoiceSessionOrchestrator = Depends(get_voice_orchestrator),
 ) -> list[VoiceEvent]:
-    if session_id not in orchestrator.sessions:
+    if not orchestrator.has_session(session_id):
         return []
     return await orchestrator.drain_events(session_id)
 
@@ -287,64 +234,47 @@ async def get_active_tools(
                 "started_at": task.created_at.astimezone().isoformat(),
             })
             
-    for session in orchestrator.sessions.values():
-        for timer in session.active_timers.values():
-            if timer.status == "running":
-                tools.append({
-                    "id": timer.timer_id,
-                    "type": "timer",
-                    "title": getattr(timer, "ui_title", None) or "Timer",
-                    "started_at": timer.started_at.astimezone().isoformat(),
-                })
-                
-        for activity in session.active_activities.values():
-            if activity.status == "active":
-                tools.append({
-                    "id": activity.activity_id,
-                    "type": "activity",
-                    "title": getattr(activity, "ui_title", None) or "Activity",
-                    "started_at": activity.started_at.astimezone().isoformat(),
-                })
-                
+    tools.extend(orchestrator.list_active_native_tools())
     return {"tools": tools}
 
 
 @router.get("/api/codex/mcp-tools")
-async def fetch_mcp_tools() -> dict[str, object]:
+async def fetch_mcp_tools(
+    codex_service: CodexAppServerService = Depends(get_codex_app_server_service),
+) -> dict[str, object]:
     try:
-        tools = await codex_app_server.get_mcp_tools()
+        tools = await codex_service.get_mcp_tools()
         return {"servers": tools}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/api/codex/mcp-tools")
-async def create_mcp_tool(request: AddMcpToolRequest) -> dict[str, object]:
+async def create_mcp_tool(
+    request: AddMcpToolRequest,
+    codex_service: CodexAppServerService = Depends(get_codex_app_server_service),
+) -> dict[str, object]:
     try:
-        await codex_app_server.add_mcp_tool(request.name, request.command, request.args)
+        await codex_service.add_mcp_tool(request.name, request.command, request.args)
         return {"success": True, "message": f"MCP tool '{request.name}' added."}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.delete("/api/codex/mcp-tools/{tool_name}")
-async def delete_mcp_tool(tool_name: str) -> dict[str, object]:
+async def delete_mcp_tool(
+    tool_name: str,
+    codex_service: CodexAppServerService = Depends(get_codex_app_server_service),
+) -> dict[str, object]:
     try:
-        await codex_app_server.remove_mcp_tool(tool_name)
+        await codex_service.remove_mcp_tool(tool_name)
         return {"success": True, "message": f"MCP tool '{tool_name}' removed."}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-webrtc_manager = None
-
 @router.post("/webrtc/offer", response_model=dict[str, str])
 async def webrtc_offer(
     request: WebRTCOfferRequest,
-    orchestrator: VoiceSessionOrchestrator = Depends(get_voice_orchestrator)
+    webrtc_manager: WebRTCSessionManager = Depends(get_webrtc_session_manager),
 ) -> dict[str, str]:
-    global webrtc_manager
-    if webrtc_manager is None:
-        from nextgen_voice_agent.transports.webrtc import WebRTCSessionManager
-        webrtc_manager = WebRTCSessionManager(orchestrator)
-        
     answer = await webrtc_manager.create_connection(
         session_id=request.session_id,
         offer_sdp=request.sdp,

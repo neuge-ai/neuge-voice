@@ -1,3 +1,4 @@
+from nextgen_voice_agent.models.runtime_contract import runtime_result_prompt_contract
 from nextgen_voice_agent.models.task import StartTaskRequest, Task
 
 
@@ -8,6 +9,7 @@ def build_codex_task_prompt(task: Task, request: StartTaskRequest) -> str:
         if task.latest_user_constraints
         else "No amendments have been provided."
     )
+    contract = runtime_result_prompt_contract(task.task_id, task.generation)
     return f"""You are the task engine behind a realtime voice assistant.
 
 Solve the user's task using available tools, web search, MCP servers, data access, and code execution when useful.
@@ -33,15 +35,5 @@ Context: {context}
 Latest user amendments or constraints:
 {constraints}
 
-Return structured JSON:
-{{
-  "task_id": "{task.task_id}",
-  "generation": {task.generation},
-  "status": "completed | needs_clarification | needs_approval | failed",
-  "spoken_answer": "Concise factual answer for the supervisor to phrase.",
-  "technical_summary": "...",
-  "sources_or_tools_used": [],
-  "actions_requiring_approval": [],
-  "followup_question": null
-}}
+{contract}
 """

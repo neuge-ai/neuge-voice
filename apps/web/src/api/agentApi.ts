@@ -1,3 +1,10 @@
+import {
+  formatApiError,
+  getApiBase,
+  requestJson,
+  setApiBase,
+} from "./client";
+
 export type Task = {
   task_id: string;
   generation: number;
@@ -55,17 +62,18 @@ export type OpenConfigFileResult = {
   error?: string;
 };
 
-export let API_BASE = import.meta.env.VITE_AGENT_API_BASE ?? "http://127.0.0.1:8000";
+export let API_BASE = getApiBase();
 export let WS_BASE = API_BASE.replace(/^http/, "ws");
 
 export async function initApiBase() {
-  const electronAPI = (window as any).electronAPI;
+  const electronAPI = (window as Window & { electronAPI?: { getBackendPort: () => Promise<number> } }).electronAPI;
   if (electronAPI) {
     try {
       const port = await electronAPI.getBackendPort();
       if (port) {
         API_BASE = `http://127.0.0.1:${port}`;
         WS_BASE = API_BASE.replace(/^http/, "ws");
+        setApiBase(API_BASE);
         console.log(`Electron sidecar detected. API Base set to: ${API_BASE}`);
         return;
       }
@@ -78,49 +86,34 @@ export async function initApiBase() {
     return;
   }
 
-  // When the Python backend serves the bundled UI, use the page origin so the
-  // API port matches (e.g. http://127.0.0.1:51237 instead of hardcoded :8000).
   const { protocol, port } = window.location;
   const isViteDevServer = import.meta.env.DEV && port === "5173";
   if (!isViteDevServer && (protocol === "http:" || protocol === "https:")) {
     API_BASE = window.location.origin;
     WS_BASE = API_BASE.replace(/^http/, "ws");
+    setApiBase(API_BASE);
     console.log(`Using page origin as API base: ${API_BASE}`);
   }
 }
 
 export async function openConfigFile(): Promise<OpenConfigFileResult> {
-  const response = await fetch(`${API_BASE}/api/config/open`, { method: "POST" });
-  if (!response.ok) {
-    throw new Error(await response.text());
-  }
-  return response.json();
+  return requestJson<OpenConfigFileResult>("/api/config/open", { method: "POST" });
 }
 
 export async function startTask(task: string): Promise<StartTaskResponse> {
-  const response = await fetch(`${API_BASE}/tasks/start`, {
+  return requestJson<StartTaskResponse>("/tasks/start", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ task }),
   });
-
-  if (!response.ok) {
-    throw new Error(await response.text());
-  }
-
-  return response.json();
 }
 
 export async function cancelTask(taskId: string): Promise<void> {
-  const response = await fetch(`${API_BASE}/tasks/${taskId}/cancel`, {
+  await requestJson(`/tasks/${taskId}/cancel`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ reason: "Cancelled from browser client." }),
   });
-
-  if (!response.ok) {
-    throw new Error(await response.text());
-  }
 }
 
 export function connectEventStream(onEvent: (event: AgentEvent) => void): WebSocket {
@@ -132,27 +125,15 @@ export function connectEventStream(onEvent: (event: AgentEvent) => void): WebSoc
 }
 
 export async function getRealtimeSessionConfig(): Promise<RealtimeSessionConfig> {
-  const response = await fetch(`${API_BASE}/realtime/session-config`);
-  if (!response.ok) {
-    throw new Error(await response.text());
-  }
-  return response.json();
+  return requestJson<RealtimeSessionConfig>("/realtime/session-config");
 }
 
 export async function createRealtimeClientSecret(): Promise<unknown> {
-  const response = await fetch(`${API_BASE}/realtime/client-secret`, { method: "POST" });
-  if (!response.ok) {
-    throw new Error(await response.text());
-  }
-  return response.json();
+  return requestJson("/realtime/client-secret", { method: "POST" });
 }
 
 export async function getHealthStatus(): Promise<HealthStatus> {
-  const response = await fetch(`${API_BASE}/health`);
-  if (!response.ok) {
-    throw new Error(await response.text());
-  }
-  return response.json();
+  return requestJson<HealthStatus>("/health");
 }
 
 export type ActiveTool = {
@@ -163,11 +144,7 @@ export type ActiveTool = {
 };
 
 export async function getActiveTools(): Promise<{ tools: ActiveTool[] }> {
-  const response = await fetch(`${API_BASE}/realtime/active-tools`);
-  if (!response.ok) {
-    throw new Error(await response.text());
-  }
-  return response.json();
+  return requestJson<{ tools: ActiveTool[] }>("/realtime/active-tools");
 }
 
 export async function synthesizeSpeech(text: string, signal?: AbortSignal): Promise<TtsResult> {
@@ -181,25 +158,4 @@ export async function synthesizeSpeech(text: string, signal?: AbortSignal): Prom
     throw new Error(await formatApiError(response, "Backend TTS synthesis failed"));
   }
   return response.json();
-}
-
-async function formatApiError(response: Response, fallback: string): Promise<string> {
-  const raw = await response.text();
-  if (!raw) {
-    return `${fallback}: HTTP ${response.status}`;
-  }
-  try {
-    const parsed = JSON.parse(raw) as { detail?: unknown };
-    if (parsed.detail && typeof parsed.detail === "object") {
-      const detail = parsed.detail as { provider?: string; stage?: string; message?: string };
-      const source = [detail.provider, detail.stage].filter(Boolean).join("/");
-      return `${fallback}${source ? ` (${source})` : ""}: ${detail.message ?? raw}`;
-    }
-    if (typeof parsed.detail === "string") {
-      return `${fallback}: ${parsed.detail}`;
-    }
-  } catch {
-    // Fall through to the raw server response.
-  }
-  return `${fallback}: ${raw}`;
 }

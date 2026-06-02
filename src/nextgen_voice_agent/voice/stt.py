@@ -394,6 +394,9 @@ def parse_asr_mode(value: str) -> AsrMode:
 
 
 def create_stt_provider(settings: Settings) -> SttProvider:
+    from nextgen_voice_agent.providers.registry import validate_stt_provider_id
+
+    validate_stt_provider_id(settings.stt_provider)
     if settings.stt_provider == "nvidia_nim":
         return NvidiaNimSttProvider(settings)
     return FakeSttProvider(settings.fake_stt_transcript)

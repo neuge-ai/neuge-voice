@@ -11,6 +11,8 @@ def test_cli_prints_hashrouter_url_without_opening_for_dynamic_port(monkeypatch,
 
     monkeypatch.setattr(cli, "get_free_port", lambda: 54321)
     monkeypatch.setattr(cli.webbrowser, "open", lambda url: opened.append(url))
+    monkeypatch.setattr(cli, "wait_for_backend_health", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "create_app", lambda settings=None: object())
     monkeypatch.setattr(
         cli.uvicorn,
         "run",
@@ -31,6 +33,7 @@ def test_cli_opens_browser_by_default_for_plain_cli(monkeypatch, capsys) -> None
     opened: list[str] = []
 
     monkeypatch.setattr(cli.webbrowser, "open", lambda url: opened.append(url))
+    monkeypatch.setattr(cli, "create_app", lambda settings=None: object())
     monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: None)
     monkeypatch.setattr("sys.argv", ["neuge", "--port", "8123"])
 
@@ -45,6 +48,7 @@ def test_cli_no_open_suppresses_browser(monkeypatch) -> None:
     opened: list[str] = []
 
     monkeypatch.setattr(cli.webbrowser, "open", lambda url: opened.append(url))
+    monkeypatch.setattr(cli, "create_app", lambda settings=None: object())
     monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: None)
     monkeypatch.setattr("sys.argv", ["neuge", "--port", "8123", "--no-open"])
 

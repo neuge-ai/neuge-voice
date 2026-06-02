@@ -5,27 +5,14 @@ from typing import Any, Literal, TypedDict
 
 from litellm import acompletion
 
+from nextgen_voice_agent.voice.tool_catalog import ROUTER_TOOL_NAMES, ROUTER_TOOLS
+
 logger = logging.getLogger(__name__)
 
 BRAIN_GLITCH_MESSAGE = "Sorry, my brain encountered a temporary glitch. Can you repeat that?"
 
-TOOL_ACTIONS = {
-    "start_task",
-    "amend_task",
-    "cancel_task",
-    "start_timer",
-    "get_timer_status",
-    "list_active_timers",
-    "cancel_timer",
-    "start_activity",
-    "get_activity_status",
-    "list_active_activities",
-    "end_activity",
-    "cancel_activity",
-    "list_active_background_tasks",
-    "get_background_task_status",
-    "cancel_background_task",
-}
+# Backward-compatible alias for tests and imports.
+TOOL_ACTIONS = ROUTER_TOOL_NAMES
 THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
 UNCLOSED_THINK_RE = re.compile(r"<think\b[^>]*>.*", re.IGNORECASE | re.DOTALL)
 FENCED_BLOCK_RE = re.compile(r"^\s*```(?:\w+)?\s*(.*?)\s*```\s*$", re.DOTALL)
@@ -71,170 +58,6 @@ def messages_with_timestamp_context(messages: list[dict[str, Any]]) -> list[dict
         normalized.append(clean)
     return normalized
 
-
-ROUTER_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "start_task",
-            "description": (
-                "Start a new powerful background task to write code, search the web, or run commands. "
-                "Use this when the user's request requires heavy lifting. For follow-up requests, inspect "
-                "the conversation history and include relevant prior facts directly in the task argument; "
-                "ask the background task only for missing/new information and comparison work."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task": {"type": "string", "description": "The goal for the background task to accomplish."}
-                },
-                "required": ["task"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "amend_task",
-            "description": "Amend or add instructions to an already running background task.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task_id": {"type": "string", "description": "The ID of the active task."},
-                    "amendment": {"type": "string", "description": "The new instructions or feedback to add to the task."},
-                },
-                "required": ["task_id", "amendment"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "cancel_task",
-            "description": "Cancel a running task.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task_id": {"type": "string", "description": "The ID of the active task to cancel."}
-                },
-                "required": ["task_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "start_timer",
-            "description": "Start a deterministic timer. Use for low-latency duration tracking; do not use Codex for timers.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "duration_ms": {"type": "integer"},
-                    "label": {"type": "string"},
-                    "reason": {"type": "string"},
-                },
-                "required": ["duration_ms", "label"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_timer_status",
-            "description": "Read elapsed and remaining time for a timer.",
-            "parameters": {"type": "object", "properties": {"timer_id": {"type": "string"}}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_active_timers",
-            "description": "List active timers.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "cancel_timer",
-            "description": "Cancel an active timer.",
-            "parameters": {"type": "object", "properties": {"timer_id": {"type": "string"}}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "start_activity",
-            "description": "Start tracking a user activity such as a run. Store factual state like type, label, start time, and any explicit targets.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "activity_type": {"type": "string"},
-                    "label": {"type": "string"},
-                    "target_duration_ms": {"type": "integer"},
-                    "target_distance_meters": {"type": "integer"},
-                },
-                "required": ["activity_type", "label"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_activity_status",
-            "description": "Read factual status for an active activity, including elapsed time and any stored targets.",
-            "parameters": {"type": "object", "properties": {"activity_id": {"type": "string"}}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_active_activities",
-            "description": "List active activities and their factual state.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "end_activity",
-            "description": "End an active activity after reasoning over the authoritative state and latest user claim.",
-            "parameters": {"type": "object", "properties": {"activity_id": {"type": "string"}}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "cancel_activity",
-            "description": "Cancel activity tracking.",
-            "parameters": {"type": "object", "properties": {"activity_id": {"type": "string"}}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_active_background_tasks",
-            "description": "List active background Codex tasks.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_background_task_status",
-            "description": "Read status for a background Codex task.",
-            "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "cancel_background_task",
-            "description": "Cancel a background Codex task.",
-            "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}, "reason": {"type": "string"}}},
-        },
-    },
-]
 
 SANITY_CHECK_INSTRUCTIONS = (
     "STATE AND PLAUSIBILITY CHECKS:\n"
@@ -311,6 +134,33 @@ def build_speak_from_state_system_prompt(system_state: str) -> str:
     )
 
 
+async def _acompletion_user_facing(
+    *,
+    model: str,
+    system_prompt: str,
+    history: list[dict[str, Any]],
+    user_content: str,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+    empty_fallback: str = "",
+) -> tuple[Any, str]:
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(messages_with_timestamp_context(history))
+    messages.append({"role": "user", "content": user_content})
+    if tools is not None:
+        response = await acompletion(
+            model=model,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice or "auto",
+        )
+    else:
+        response = await acompletion(model=model, messages=messages)
+    message = response.choices[0].message
+    text = sanitize_user_facing_text(message.content or "", empty_fallback)
+    return message, text
+
+
 class OrchestratorLLMProvider:
     def __init__(self, model: str = "groq/qwen/qwen3-32b"):
         self.model = model
@@ -325,25 +175,21 @@ class OrchestratorLLMProvider:
         Sends the conversation history + user text to the LLM and returns either
         a direct assistant response or a parsed tool call decision.
         """
-        messages = [{"role": "system", "content": build_route_turn_system_prompt(system_state)}]
-        messages.extend(messages_with_timestamp_context(conversation_history))
-        messages.append({"role": "user", "content": user_text})
-
         logger.info(f"LLM Router called with user text: {user_text}")
 
         try:
-            response = await acompletion(
+            message, _ = await _acompletion_user_facing(
                 model=self.model,
-                messages=messages,
+                system_prompt=build_route_turn_system_prompt(system_state),
+                history=conversation_history,
+                user_content=user_text,
                 tools=ROUTER_TOOLS,
                 tool_choice="auto",
             )
-            
-            message = response.choices[0].message
             if message.tool_calls and len(message.tool_calls) > 0:
                 tool_call = message.tool_calls[0]
                 function_name = tool_call.function.name
-                if function_name not in TOOL_ACTIONS:
+                if function_name not in ROUTER_TOOL_NAMES:
                     logger.warning(f"LLM Router returned unknown tool: {function_name}")
                     return {
                         "type": "assistant_response",
@@ -351,7 +197,7 @@ class OrchestratorLLMProvider:
                     }
                 arguments = json.loads(tool_call.function.arguments)
                 assistant_response = sanitize_user_facing_text(message.content or "", "I'll look into that.")
-                
+
                 decision: RouterDecision = {
                     "type": "tool_call",
                     "tool": function_name,
@@ -360,9 +206,8 @@ class OrchestratorLLMProvider:
                 }
                 logger.info(f"LLM Router Decision: {decision}")
                 return decision
-            else:
-                text = sanitize_user_facing_text(message.content or "", "I am not sure how to handle that.")
-                return {"type": "assistant_response", "response": text}
+            direct_text = sanitize_user_facing_text(message.content or "", "I am not sure how to handle that.")
+            return {"type": "assistant_response", "response": direct_text}
                 
         except Exception as e:
             logger.error(f"Error calling LLM Router: {e}")
@@ -375,17 +220,13 @@ class OrchestratorLLMProvider:
         system_state: str,
         conversation_history: list[dict[str, Any]],
     ) -> str:
-        messages = [{"role": "system", "content": build_speak_from_state_system_prompt(system_state)}]
-        messages.extend(messages_with_timestamp_context(conversation_history))
         anchor = user_text or "(none — background event)"
-        messages.append(
-            {
-                "role": "user",
-                "content": f"{instruction}\n\nLatest user text: {anchor}",
-            }
+        _, text = await _acompletion_user_facing(
+            model=self.model,
+            system_prompt=build_speak_from_state_system_prompt(system_state),
+            history=conversation_history,
+            user_content=f"{instruction}\n\nLatest user text: {anchor}",
         )
-        response = await acompletion(model=self.model, messages=messages)
-        text = sanitize_user_facing_text(response.choices[0].message.content or "", "")
         if not text:
             raise RuntimeError("empty speak response")
         return text

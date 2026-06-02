@@ -566,6 +566,31 @@ async def test_orchestrator_allows_native_timer_while_codex_task_runs() -> None:
 
 
 @pytest.mark.asyncio
+async def test_native_tool_turn_records_history_in_order() -> None:
+    class TimerRouter(SpeakFromStateMixin):
+        async def route_turn(self, user_text, system_state, conversation_history):
+            return {
+                "type": "tool_call",
+                "tool": "start_timer",
+                "arguments": {"duration_ms": 60000, "label": "one minute"},
+                "assistant_response": "Starting timer.",
+            }
+
+    orchestrator = VoiceSessionOrchestrator(
+        controller=AgentController(runtime=FakeRuntime()),
+        llm_provider=TimerRouter(),
+    )
+    session_id = "browser-session"
+    await orchestrator.handle_voice_event(
+        session_id,
+        VoiceEvent(event=VoiceEventType.USER_TURN, transport=VoiceTransportKind.BROWSER, session_id=session_id, text="Set a one minute timer."),
+    )
+    roles = [message.get("role") for message in orchestrator.sessions[session_id].conversation_history]
+    assert roles == ["user", "assistant", "tool", "assistant"]
+    await orchestrator.stop_session(session_id)
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_state_marks_active_codex_task_as_amendable() -> None:
     controller = AgentController(runtime=FakeRuntime(delay_seconds=1.0))
     orchestrator = VoiceSessionOrchestrator(controller=controller, timing=VoiceTimingConfig(control_loop_ms=10))

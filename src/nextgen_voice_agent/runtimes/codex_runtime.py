@@ -8,7 +8,6 @@ import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +18,19 @@ from nextgen_voice_agent.models.runtime import (
     RuntimeResultStatus,
     RuntimeTaskRequest,
 )
+from nextgen_voice_agent.models.runtime_contract import runtime_result_output_schema
 from nextgen_voice_agent.runtimes.base import RuntimeMessage, TaskRuntime
+from nextgen_voice_agent.runtimes.codex_rpc_models import (
+    KNOWN_NOTIFICATION_METHODS,
+    JsonRpcNotification,
+    JsonRpcResponse,
+    ThreadStartResult,
+    TurnNotificationParams,
+    TurnPayload,
+    TurnStartResult,
+)
+
+_TurnPayloadInput = TurnPayload | dict[str, Any]
 
 logger = logging.getLogger(__name__)
 
@@ -230,13 +241,25 @@ class CodexAppServerClient:
             future = self._pending.pop(request_id, None)
             if future is None or future.done():
                 return
-            if "error" in message:
-                future.set_exception(CodexAppServerError(str(message["error"])))
+            try:
+                response = JsonRpcResponse.model_validate(message)
+            except Exception:
+                logger.warning("Ignoring malformed Codex JSON-RPC response: %r", message)
+                return
+            if response.error is not None:
+                future.set_exception(CodexAppServerError(str(response.error)))
             else:
-                future.set_result(message.get("result"))
+                future.set_result(response.result)
             return
 
         if "method" in message:
+            try:
+                notification = JsonRpcNotification.model_validate(message)
+            except Exception:
+                logger.warning("Ignoring malformed Codex JSON-RPC notification: %r", message)
+                return
+            if notification.method not in KNOWN_NOTIFICATION_METHODS:
+                logger.info("Unknown Codex app-server notification: %s", notification.method)
             for queue in list(self._notifications):
                 queue.put_nowait(message)
 
@@ -265,7 +288,8 @@ class CodexAppServerRuntime(TaskRuntime):
         self.model = model
         self.config = config or CodexAppServerRuntimeConfig()
         self.process_factory = process_factory or asyncio.create_subprocess_exec
-        self.schema_path = schema_path or self._default_schema_path()
+        self._schema_path = schema_path
+        self._output_schema: dict[str, Any] | None = None
         self.client = client or CodexAppServerClient(
             command=command,
             config=self.config,
@@ -366,24 +390,32 @@ class CodexAppServerRuntime(TaskRuntime):
     ) -> None:
         event_summaries: list[str] = []
         async for notification in self.client.subscribe():
-            method = str(notification.get("method", ""))
-            params = notification.get("params") or {}
-            if not isinstance(params, dict) or params.get("threadId") != thread_id:
+            try:
+                parsed_notification = JsonRpcNotification.model_validate(notification)
+            except Exception:
+                continue
+            method = parsed_notification.method
+            raw_params = parsed_notification.params or {}
+            try:
+                params = TurnNotificationParams.model_validate(raw_params)
+            except Exception:
+                continue
+            if params.threadId != thread_id:
                 continue
 
-            turn_id = params.get("turnId")
+            turn_id = params.turnId
             state = self._tasks.get(request.task_id)
             if state is not None and turn_id is not None and turn_id != state.turn_id:
                 continue
 
             generation = state.generation if state is not None else request.generation
-            progress = self._notification_progress(request, generation, method, params)
+            progress = self._notification_progress(request, generation, method, raw_params)
             if progress:
                 event_summaries.append(progress.message)
                 await event_queue.put(progress)
 
             if method == "turn/completed":
-                final_text = self._extract_final_assistant_text(params.get("turn"))
+                final_text = self._extract_final_assistant_text(params.turn)
                 await event_queue.put(
                     self._build_result(
                         request,
@@ -477,43 +509,47 @@ class CodexAppServerRuntime(TaskRuntime):
         return None
 
     def _extract_thread_id(self, response: Any) -> str | None:
-        if not isinstance(response, dict):
+        try:
+            parsed = ThreadStartResult.model_validate(response)
+        except Exception:
             return None
-        thread = response.get("thread")
-        if isinstance(thread, dict):
-            value = thread.get("id") or thread.get("threadId")
+        if parsed.thread is not None:
+            value = parsed.thread.id or parsed.thread.threadId
             if isinstance(value, str):
                 return value
-        value = response.get("threadId") or response.get("id")
+        value = parsed.threadId or parsed.id
         return value if isinstance(value, str) else None
 
     def _extract_turn_id(self, response: Any) -> str | None:
-        if not isinstance(response, dict):
+        try:
+            parsed = TurnStartResult.model_validate(response)
+        except Exception:
             return None
-        turn = response.get("turn")
-        if isinstance(turn, dict):
-            value = turn.get("id") or turn.get("turnId")
+        if parsed.turn is not None:
+            value = parsed.turn.id or parsed.turn.turnId
             if isinstance(value, str):
                 return value
-        value = response.get("turnId") or response.get("id")
+        value = parsed.turnId or parsed.id
         return value if isinstance(value, str) else None
 
-    def _extract_final_assistant_text(self, turn: Any) -> str:
-        if not isinstance(turn, dict):
-            return ""
-        items = turn.get("items")
-        if not isinstance(items, list):
+    def _extract_final_assistant_text(self, turn: _TurnPayloadInput | Any) -> str:
+        try:
+            if isinstance(turn, TurnPayload):
+                parsed_turn = turn
+            elif isinstance(turn, dict):
+                parsed_turn = TurnPayload.model_validate(turn)
+            else:
+                return ""
+        except Exception:
             return ""
         assistant_texts: list[tuple[bool, str]] = []
-        for item in items:
-            if not isinstance(item, dict):
+        for item in parsed_turn.items:
+            if item.type not in {"agentMessage", "assistant_message", "assistant"}:
                 continue
-            if item.get("type") not in {"agentMessage", "assistant_message", "assistant"}:
-                continue
-            text = item.get("text")
+            text = item.text
             if not isinstance(text, str) or not text.strip():
                 continue
-            assistant_texts.append((item.get("phase") == "final_answer", text.strip()))
+            assistant_texts.append((item.phase == "final_answer", text.strip()))
         for is_final, text in reversed(assistant_texts):
             if is_final:
                 return text
@@ -560,10 +596,11 @@ class CodexAppServerRuntime(TaskRuntime):
         )
 
     def _load_output_schema(self) -> dict[str, Any]:
-        return json.loads(self.schema_path.read_text(encoding="utf-8"))
-
-    def _default_schema_path(self) -> Path:
-        return Path(str(resources.files("nextgen_voice_agent.runtimes").joinpath("runtime_result.schema.json")))
+        if self._schema_path is not None:
+            return json.loads(self._schema_path.read_text(encoding="utf-8"))
+        if self._output_schema is None:
+            self._output_schema = runtime_result_output_schema()
+        return self._output_schema
 
 
 @dataclass

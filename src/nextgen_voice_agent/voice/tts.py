@@ -279,6 +279,9 @@ def _wav_from_pcm(pcm: bytes, sample_rate_hz: int) -> bytes:
 
 
 def create_tts_provider(settings: Settings) -> TtsProvider:
+    from nextgen_voice_agent.providers.registry import validate_tts_provider_id
+
+    validate_tts_provider_id(settings.tts_provider)
     if settings.tts_provider == "nvidia_nim":
         return NvidiaNimTtsProvider(settings)
     if settings.tts_provider == "browser_dev":
@@ -287,5 +290,4 @@ def create_tts_provider(settings: Settings) -> TtsProvider:
         return ElevenLabsTtsProvider(settings)
     if settings.tts_provider == "sarvam":
         return SarvamTtsProvider(settings)
-    supported = ", ".join(("nvidia_nim", "browser_dev", "elevenlabs", "sarvam"))
-    raise RuntimeError(f"Unsupported TTS provider {settings.tts_provider!r}. Supported providers: {supported}.")
+    raise RuntimeError(f"Unsupported TTS provider {settings.tts_provider!r}.")

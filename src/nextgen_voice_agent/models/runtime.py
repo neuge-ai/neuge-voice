@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class RuntimeResultStatus(StrEnum):
@@ -16,6 +16,8 @@ class RuntimeResultStatus(StrEnum):
 
 
 class ApprovalAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     action_id: str
     description: str
     risk: str = "write"
@@ -37,6 +39,8 @@ class RuntimeAmendment(BaseModel):
 
 
 class RuntimeResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     task_id: str
     generation: int = Field(ge=1)
     status: RuntimeResultStatus

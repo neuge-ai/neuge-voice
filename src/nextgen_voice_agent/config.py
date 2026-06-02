@@ -35,6 +35,15 @@ class Settings(BaseModel):
     sarvam_target_language_code: str = "en-IN"
     sarvam_model: str = "bulbul:v3"
     sarvam_speaker: str = "priya"
+    max_completed_tasks: int = 50
+    completed_task_ttl_minutes: int = 240
+    event_history_limit: int = 200
+    conversation_history_limit: int = 100
+    voice_session_idle_timeout_minutes: int = 30
+    delivery_record_ttl_minutes: int = 60
+    backend_run_mode: str = "managed_local"
+    ui_serving_mode: str = "backend_static"
+    cors_allowed_origins: list[str] = Field(default_factory=list)
 
 
 def get_secret(key_name: str) -> str | None:
@@ -48,7 +57,10 @@ def get_secret(key_name: str) -> str | None:
         return None
 
 def set_secret(key_name: str, value: str) -> None:
-    keyring.set_password("NeugeVoice", key_name, value)
+    try:
+        keyring.set_password("NeugeVoice", key_name, value)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to write secret {key_name!r} to keyring: {exc}") from exc
 
 
 def load_toml_config() -> dict:

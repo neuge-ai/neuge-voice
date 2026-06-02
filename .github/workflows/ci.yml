@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install backend dependencies
+        run: uv sync --extra dev
+      - name: Run focused backend tests
+        run: >
+          uv run pytest
+          tests/test_voice_orchestrator.py
+          tests/test_llm_router.py
+          tests/test_server.py
+          tests/test_stt_pipeline.py
+          tests/test_main_cli.py
+          tests/test_architecture_boundaries.py
+          tests/test_runtime_mode.py
+          tests/test_app_factory.py
+          tests/test_managed_backend_launcher.py
+          tests/test_config_diagnostics.py
+          tests/test_product_boundaries.py
+          tests/test_runtime_result_contract.py
+          tests/test_codex_app_server_runtime.py
+          tests/test_mcp_api.py
+          tests/test_app_lifecycle.py
+          -q
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: Install and build frontend
+        run: |
+          npm ci
+          npm run build
